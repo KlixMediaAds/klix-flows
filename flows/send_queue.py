@@ -1,5 +1,3 @@
-cd /opt/klix
-cat > flows/send_queue.py <<'PY'
 from __future__ import annotations
 from typing import Optional, List, Dict
 from datetime import datetime
@@ -7,19 +5,18 @@ from datetime import datetime
 from prefect import flow, task, get_run_logger
 from sqlalchemy import MetaData, Table, select, update
 from sqlalchemy.orm import Session
-
-# ✅ use absolute import and get_engine()
-from flows.db import get_engine
+from flows.db import get_engine  # absolute import; we use get_engine()
 
 def _engine():
     return get_engine()
 
 metadata = MetaData()
+
 def _tbl(name: str) -> Table:
     # autoload table definitions from the current engine
     return Table(name, metadata, autoload_with=_engine())
 
-# ---- TEMP: stub sender (replace with your real email sender later) ----
+# ---- TEMP: stub sender (replace with your real sender later) ----
 def send_email_stub(to: str, subject: str, body: str, meta: Optional[Dict] = None) -> str:
     return f"mock-{int(datetime.utcnow().timestamp())}"
 
@@ -87,4 +84,3 @@ def send_queue(batch_size: int = 25) -> int:
     updated = persist_results(results)
     get_run_logger().info(f"Updated {updated} email_sends rows")
     return updated
-PY
