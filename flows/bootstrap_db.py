@@ -1,15 +1,10 @@
-from prefect import flow, task
-from flows.db import engine
-from flows.schema import Base
+from prefect import flow
+from flows.db import ensure_tables
 
-@task
-def create_tables():
-    Base.metadata.create_all(bind=engine)
-    print("✅ Tables created (or already exist).")
-
-@flow
+@flow(name="bootstrap_db")
 def bootstrap_db():
-    create_tables()
+    ensure_tables()
+    return "ok"
 
 if __name__ == "__main__":
     bootstrap_db()

@@ -1,7 +1,22 @@
 import os
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine, text
 
-DATABASE_URL = os.environ["DATABASE_URL"]
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+def get_engine():
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        raise RuntimeError("DATABASE_URL not set")
+    return create_engine(url, pool_pre_ping=True)
+
+def ensure_tables():
+    eng = get_engine()
+    with eng.begin() as cx:
+        cx.execute(text("""
+        CREATE TABLE IF NOT EXISTS leads (
+            id BIGSERIAL PRIMARY KEY,
+            company TEXT,
+            email TEXT,
+            website TEXT,
+            source TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        """))
