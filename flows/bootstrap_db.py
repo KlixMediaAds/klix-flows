@@ -1,7 +1,7 @@
 # flows/bootstrap_db.py
 from prefect import flow, task, get_run_logger
 from sqlalchemy import text
-from .db import engine  # uses your SQLAlchemy create_engine bound to DATABASE_URL
+from .db import get_engine  # <-- use get_engine(), NOT engine
 
 # Idempotent DDL (safe to run repeatedly). No UNIQUE on email to avoid dup errors.
 SCHEMA_SQL = """
@@ -46,9 +46,10 @@ CREATE TABLE IF NOT EXISTS events (
 
 @task
 def apply_schema() -> None:
-    # Execute statements one by one under a single transaction
-    stmts = [s.strip() for s in SCHEMA_SQL.strip().split(";\n") if s.strip()]
-    with engine.begin() as conn:
+    eng = get_engine()
+    # execute statements one-by-one to avoid multi-statement restrictions
+    stmts = [s.strip() for s in SCHEMA_SQL.strip().split(";") if s.strip()]
+    with eng.begin() as conn:
         for s in stmts:
             conn.exec_driver_sql(s + ";")
 
@@ -57,8 +58,7 @@ def bootstrap_db() -> str:
     logger = get_run_logger()
     logger.info("Applying idempotent schema migrations…")
     apply_schema()
-    # quick visibility
-    with engine.connect() as c:
+    with get_engine().connect() as c:
         cnt = c.execute(text("SELECT count(*) FROM leads;")).scalar()
     logger.info(f"✅ Schema ensured. leads.count={cnt}")
     return "ok"
