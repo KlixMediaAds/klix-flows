@@ -1,4 +1,5 @@
-# flows/send_queue.py
+cd /opt/klix
+cat > flows/send_queue.py <<'PY'
 from __future__ import annotations
 from typing import Optional, List, Dict
 from datetime import datetime
@@ -6,22 +7,29 @@ from datetime import datetime
 from prefect import flow, task, get_run_logger
 from sqlalchemy import MetaData, Table, select, update
 from sqlalchemy.orm import Session
-from .db import engine
 
-# --- TEMP: stub sender (replace with your real email_sender later) ---
-def send_email_stub(to: str, subject: str, body: str, meta: Optional[Dict] = None) -> str:
-    return f"mock-{int(datetime.utcnow().timestamp())}"
+# ✅ use absolute import and get_engine()
+from flows.db import get_engine
+
+def _engine():
+    return get_engine()
 
 metadata = MetaData()
 def _tbl(name: str) -> Table:
-    return Table(name, metadata, autoload_with=engine)
+    # autoload table definitions from the current engine
+    return Table(name, metadata, autoload_with=_engine())
+
+# ---- TEMP: stub sender (replace with your real email sender later) ----
+def send_email_stub(to: str, subject: str, body: str, meta: Optional[Dict] = None) -> str:
+    return f"mock-{int(datetime.utcnow().timestamp())}"
 
 @task
 def fetch_queued(batch_size: int) -> List[Dict]:
     logger = get_run_logger()
-    sends = _tbl("email_sends"); leads = _tbl("leads")
+    sends = _tbl("email_sends")
+    leads = _tbl("leads")
     out: List[Dict] = []
-    with Session(engine) as s:
+    with Session(_engine()) as s:
         rows = s.execute(
             select(
                 sends.c.id, sends.c.lead_id, sends.c.subject, sends.c.body,
@@ -33,8 +41,10 @@ def fetch_queued(batch_size: int) -> List[Dict]:
             .limit(batch_size)
         ).all()
         for rid, lead_id, subject, body, email, company in rows:
-            out.append({"send_id": rid, "lead_id": lead_id, "to": email,
-                        "company": company, "subject": subject, "body": body})
+            out.append({
+                "send_id": rid, "lead_id": lead_id, "to": email,
+                "company": company, "subject": subject, "body": body
+            })
     logger.info(f"Fetched {len(out)} queued emails")
     return out
 
@@ -56,7 +66,7 @@ def deliver(batch: List[Dict]) -> List[Dict]:
 def persist_results(results: List[Dict]) -> int:
     sends = _tbl("email_sends")
     count = 0
-    with Session(engine) as s:
+    with Session(_engine()) as s:
         for r in results:
             s.execute(
                 update(sends)
@@ -77,3 +87,4 @@ def send_queue(batch_size: int = 25) -> int:
     updated = persist_results(results)
     get_run_logger().info(f"Updated {updated} email_sends rows")
     return updated
+PY
