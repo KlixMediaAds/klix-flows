@@ -1,0 +1,9 @@
+# keep secrets and local stuff out of Prefect code storage
+.env
+*.json
+secrets/
+venv/
+__pycache__/
+*.pyc
+*.log
+.git/

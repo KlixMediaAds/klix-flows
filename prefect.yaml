@@ -1,0 +1,10 @@
+name: klix
+deployments:
+  - name: bootstrap-db
+    entrypoint: flows/bootstrap_db.py:bootstrap_db
+    work_pool:
+      name: klix-managed
+  - name: demo-ingest
+    entrypoint: flows/demo_flow.py:demo_ingest
+    work_pool:
+      name: klix-managed
