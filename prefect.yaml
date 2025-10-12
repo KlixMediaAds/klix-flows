@@ -1,10 +1,66 @@
-name: klix
+# Prefect 3 deployment config — Git-backed
+# Docs: https://docs.prefect.io/latest/deploy/infrastructure/managed
+
+# ---- GLOBALS (optional) ----
+# build: []          # (not needed for managed)
+# push: []           # (managed will clone Git itself)
+
 deployments:
+  # --- 1) bootstrap-db ---
   - name: bootstrap-db
     entrypoint: flows/bootstrap_db.py:bootstrap_db
+    storage:
+      type: git
+      repository: https://github.com/KlixMediaAds/klix-flows.git
+      reference: main
+      path: flows
     work_pool:
       name: klix-managed
+      job_variables:
+        # Packages the managed worker should pip install:
+        pip_packages:
+          - psycopg[binary]==3.2.1
+          - SQLAlchemy==2.0.36
+          - requests==2.32.3
+          - python-dotenv==1.0.1
+        # Environment passed to the run:
+        env:
+          DATABASE_URL: "postgresql://neondb_owner:npg_saKXL23rzgvI@ep-shiny-cloud-adpyimu9-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+
+  # --- 2) demo-ingest ---
   - name: demo-ingest
-    entrypoint: flows/demo_flow.py:demo_ingest
+    entrypoint: flows/demo_ingest.py:demo_ingest
+    storage:
+      type: git
+      repository: https://github.com/KlixMediaAds/klix-flows.git
+      reference: main
+      path: flows
     work_pool:
       name: klix-managed
+      job_variables:
+        pip_packages:
+          - psycopg[binary]==3.2.1
+          - SQLAlchemy==2.0.36
+          - requests==2.32.3
+          - python-dotenv==1.0.1
+        env:
+          DATABASE_URL: "postgresql://neondb_owner:npg_saKXL23rzgvI@ep-shiny-cloud-adpyimu9-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+
+  # --- 3) real-ingest ---
+  - name: real-ingest
+    entrypoint: flows/real_ingest.py:real_ingest
+    storage:
+      type: git
+      repository: https://github.com/KlixMediaAds/klix-flows.git
+      reference: main
+      path: flows
+    work_pool:
+      name: klix-managed
+      job_variables:
+        pip_packages:
+          - psycopg[binary]==3.2.1
+          - SQLAlchemy==2.0.36
+          - requests==2.32.3
+          - python-dotenv==1.0.1
+        env:
+          DATABASE_URL: "postgresql://neondb_owner:npg_saKXL23rzgvI@ep-shiny-cloud-adpyimu9-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
