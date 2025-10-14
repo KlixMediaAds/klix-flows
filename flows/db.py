@@ -6,20 +6,24 @@ from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 
+
 def _normalize_scheme(url: str) -> str:
-    # Ensure SQLAlchemy uses psycopg v3
+    """Ensure SQLAlchemy uses psycopg v3 driver."""
     if url.startswith("postgresql+psycopg2://"):
         return "postgresql+psycopg://" + url.split("://", 1)[1]
     if url.startswith("postgresql://"):
         return "postgresql+psycopg://" + url.split("://", 1)[1]
     return url
 
+
 def _strip_param(url: str, key: str) -> str:
     p = urlparse(url)
     q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True) if k != key]
     return urlunparse(p._replace(query=urlencode(q)))
 
+
 def _ensure_ssl_require(url: str) -> str:
+    """Force sslmode=require (Neon-compatible)."""
     p = urlparse(url)
     q = dict(parse_qsl(p.query, keep_blank_values=True))
     if q.get("sslmode") != "require":
@@ -27,10 +31,11 @@ def _ensure_ssl_require(url: str) -> str:
         return urlunparse(p._replace(query=urlencode(q)))
     return url
 
+
 def _build_url_from_env() -> str:
+    """Get a SQLAlchemy URL from DATABASE_URL or PG* env vars."""
     url = os.getenv("DATABASE_URL", "")
     if not url:
-        # Fallback to PG* envs if DATABASE_URL not provided
         user = os.getenv("PGUSER")
         pw   = os.getenv("PGPASSWORD")
         host = os.getenv("PGHOST")
@@ -47,10 +52,21 @@ def _build_url_from_env() -> str:
     url = _ensure_ssl_require(url)              # Neon: TLS required
     return url
 
+
 _ENGINE: Engine | None = None
 
+
 def get_engine() -> Engine:
+    """Return a (singleton) SQLAlchemy engine; does not connect until used."""
     global _ENGINE
     if _ENGINE is None:
         _ENGINE = create_engine(_build_url_from_env(), pool_pre_ping=True)
     return _ENGINE
+
+
+# ---------------------------------------------------------------------------
+# Backward-compat shim: some old code imported `ensure_tables` from here.
+# Keep a harmless no-op to avoid ImportError.
+def ensure_tables(*args, **kwargs):
+    return None
+# ---------------------------------------------------------------------------
