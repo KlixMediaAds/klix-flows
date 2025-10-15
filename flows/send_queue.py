@@ -1,3 +1,5 @@
+# overwrite the file with the finalized version
+cat > /opt/klix/repo/flows/send_queue.py <<'PY'
 from __future__ import annotations
 from typing import Optional, List, Dict
 from datetime import datetime
@@ -114,9 +116,20 @@ def send_queue(
 ) -> int:
     """
     Drains queued emails and writes provider_message_id.
-    Weekend safety: by default, does nothing on Sat/Sun unless allow_weekend=True.
+
+    Safety:
+      - Weekend guard: does nothing on Sat/Sun unless allow_weekend=True.
+      - Trip flag: set TRIP_SENDQ=1 (or 'true'/'yes'/'on') in env to force a failure for alert tests.
     """
     log = get_run_logger()
+
+    # --- Trip block (kept permanently for testing alerts) ---
+    trip = os.getenv("TRIP_SENDQ", "").strip().lower() in {"1", "true", "yes", "on"}
+    if trip:
+        reason = os.getenv("TRIP_SENDQ_REASON", "Manual trip for alert test")
+        raise RuntimeError(reason)
+    # --------------------------------------------------------
+
     tz = zoneinfo.ZoneInfo(tz_name)
     is_weekend = datetime.now(tz).weekday() >= 5  # 5=Sat, 6=Sun
 
@@ -133,3 +146,4 @@ def send_queue(
     updated = persist_results(results)
     log.info(f"Updated {updated} rows in email_sends.")
     return updated
+PY
