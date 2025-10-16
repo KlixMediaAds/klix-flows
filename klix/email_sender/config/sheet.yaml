@@ -1,0 +1,25 @@
+spreadsheet_id: "${SHEET_ID}"
+
+tabs:
+  prospects: "Prospects"   # your tab in the screenshot
+  emails: "Emails"         # your tab in the screenshot (case-insensitive OK)
+
+columns:
+  emails:
+    id: "EmailID"
+    prospect_id: "ProspectID"
+    business_name: "BusinessName"
+    to_email: "ToEmail"
+    persona: "PersonaTarget"
+    angle: "Angle"
+    subject: "Subject"
+    body_md: "BodyMD"
+    drafted_at: "DraftedAt"
+    status: "Status"
+    model: "Model"
+    notes: "Notes"
+
+  prospects:
+    id: "ID"
+    status: "Status"
+    last_touched_at: "LastTouchedAt"

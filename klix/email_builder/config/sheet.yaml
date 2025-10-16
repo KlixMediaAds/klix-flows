@@ -1,0 +1,4 @@
+spreadsheet_id: "${EMAIL_BUILDER_SHEET_ID}"
+tabs:
+  prospects: "Prospects"
+  emails: "Emails"

@@ -1,0 +1,10 @@
+New York, NY
+Los Angeles, CA
+Miami, FL
+Dallas, TX
+Phoenix, AZ
+Seattle, WA
+Atlanta, GA
+Chicago, IL
+Austin, TX
+Denver, CO

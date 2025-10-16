@@ -1,7 +1,31 @@
-venv/
+﻿# --- Python ---
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.egg-info/
+
+# --- Virtual envs ---
+.venv/
+venv/
+env/
+
+# --- Secrets / credentials ---
 .env
-.DS_Store
+*.env
+sa.json
+*.pem
+*.key
+*.pfx
+
+# --- Local data / caches ---
+*.db
+*.sqlite*
+klix/lead_finder/*.csv
+
+# --- Logs ---
 *.log
-send_queue.prefect.yaml
+klix/email_sender/logs/
+
+# --- OS cruft ---
+.DS_Store
+Thumbs.db
