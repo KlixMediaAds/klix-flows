@@ -1,149 +1,127 @@
-# overwrite the file with the finalized version
-cat > /opt/klix/repo/flows/send_queue.py <<'PY'
-from __future__ import annotations
-from typing import Optional, List, Dict
-from datetime import datetime
-import os
-import zoneinfo
+from datetime import datetime, timezone
+import os, time, random, ssl, smtplib
+from email.message import EmailMessage
 
-from prefect import flow, task, get_run_logger
-from sqlalchemy import MetaData, Table, select, update
-from sqlalchemy.orm import Session
+from sqlalchemy import select, update, text
+from sqlalchemy.sql import func
+from prefect import flow, get_run_logger
 
-from flows.db import get_engine
-from toolkit.providers.sendgrid import send_email_sendgrid, SendError  # optional, uses env to decide
+from flows.db import SessionLocal
+from flows.schema import leads, email_sends
 
+def _fetch_batch(s, limit:int):
+    q = (
+        select(
+            email_sends.c.id,
+            email_sends.c.lead_id,
+            leads.c.email,
+            email_sends.c.send_type,
+            email_sends.c.subject,
+            email_sends.c.body,
+        )
+        .select_from(email_sends.join(leads, email_sends.c.lead_id == leads.c.id))
+        .where(email_sends.c.status == "queued")
+        .order_by(email_sends.c.id.asc())
+        .limit(limit)
+    )
+    return s.execute(q).fetchall()
 
-# ---------- DB helpers ----------
-def _engine():
-    return get_engine()
+def _sent_today(s) -> int:
+    # Count rows marked sent today (UTC)
+    r = s.execute(text("select count(*) from email_sends where sent_at::date = CURRENT_DATE")).scalar()
+    return int(r or 0)
 
-metadata = MetaData()
+def _smtp_send(to_addr: str, subject: str, body: str) -> str:
+    host = os.getenv("SMTP_HOST")
+    port = int(os.getenv("SMTP_PORT", "587"))
+    user = os.getenv("SMTP_USER")
+    pw   = os.getenv("SMTP_PASS")
+    from_email = os.getenv("FROM_EMAIL", user or "")
+    from_name  = os.getenv("FROM_NAME", "")
 
-def _tbl(name: str) -> Table:
-    return Table(name, metadata, autoload_with=_engine())
+    if not host or not from_email:
+        raise RuntimeError("SMTP_HOST / FROM_EMAIL not set")
 
+    msg = EmailMessage()
+    msg["From"] = f"{from_name} <{from_email}>" if from_name else from_email
+    msg["To"] = to_addr
+    msg["Subject"] = subject
+    # basic unsubscribe header; customize later
+    msg["List-Unsubscribe"] = f"<mailto:{from_email}?subject=unsubscribe>"
+    msg.set_content(body)
 
-# ---------- TEMP mailer (fallback if no SENDGRID_API_KEY) ----------
-def send_email_stub(to: str, subject: str, body: str, meta: Optional[Dict] = None) -> str:
-    return f"mock-{int(datetime.utcnow().timestamp())}"
-
-
-# ---------- Tasks ----------
-@task(name="fetch_queued")
-def fetch_queued(batch_size: int) -> List[Dict]:
-    log = get_run_logger()
-    sends = _tbl("email_sends")
-    leads = _tbl("leads")
-    out: List[Dict] = []
-
-    with Session(_engine()) as s:
-        rows = s.execute(
-            select(
-                sends.c.id,
-                sends.c.lead_id,
-                sends.c.subject,
-                sends.c.body,
-                leads.c.email,
-                leads.c.company,
-            )
-            .join(leads, leads.c.id == sends.c.lead_id)
-            .where(sends.c.status == "queued")
-            .order_by(sends.c.id.asc())
-            .limit(batch_size)
-        ).all()
-
-        for rid, lead_id, subject, body, email, company in rows:
-            out.append({
-                "send_id": rid,
-                "lead_id": lead_id,
-                "to": email,
-                "company": company,
-                "subject": subject,
-                "body": body,
-            })
-
-    log.info(f"Fetched {len(out)} queued emails (batch_size={batch_size})")
-    return out
-
-
-@task(name="deliver_batch")
-def deliver(batch: List[Dict]) -> List[Dict]:
-    log = get_run_logger()
-    results: List[Dict] = []
-
-    for item in batch:
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP(host, port, timeout=30) as s:
         try:
-            if os.getenv("SENDGRID_API_KEY"):
-                msg_id = send_email_sendgrid(item["to"], item["subject"], item["body"])
-            else:
-                msg_id = send_email_stub(
-                    item["to"], item["subject"], item["body"], meta={"lead_id": item["lead_id"]}
-                )
-            results.append({"send_id": item["send_id"], "status": "sent", "message_id": msg_id})
-        except Exception as e:
-            log.warning(f"Send failed for send_id={item['send_id']}: {e}")
-            results.append({"send_id": item["send_id"], "status": "failed", "message_id": None})
+            s.starttls(context=ctx)
+        except smtplib.SMTPNotSupportedError:
+            pass
+        if user:
+            s.login(user, pw)
+        # returns dict of failures; empty dict == success
+        failures = s.send_message(msg)
+    if failures:
+        raise RuntimeError(f"SMTP send failures: {failures}")
+    # We don't get a provider message-id via SMTP; return a synthetic one
+    return f"smtp-{int(time.time()*1000)}"
 
-    sent = sum(1 for r in results if r["status"] == "sent")
-    failed = len(results) - sent
-    log.info(f"Deliver summary → sent={sent}, failed={failed}")
-    return results
-
-
-@task(name="persist_results")
-def persist_results(results: List[Dict]) -> int:
-    sends = _tbl("email_sends")
-    updated = 0
-    with Session(_engine()) as s:
-        for r in results:
-            s.execute(
-                update(sends)
-                .where(sends.c.id == r["send_id"])
-                .values(status=r["status"], provider_message_id=r["message_id"])
-            )
-            updated += 1
-        s.commit()
-    return updated
-
-
-# ---------- Flow ----------
 @flow(name="send_queue")
-def send_queue(
-    batch_size: int = 25,
-    allow_weekend: bool = False,
-    tz_name: str = "America/Toronto",
-) -> int:
-    """
-    Drains queued emails and writes provider_message_id.
-
-    Safety:
-      - Weekend guard: does nothing on Sat/Sun unless allow_weekend=True.
-      - Trip flag: set TRIP_SENDQ=1 (or 'true'/'yes'/'on') in env to force a failure for alert tests.
-    """
+def send_queue(batch_size: int = 25, allow_weekend: bool = False) -> int:
     log = get_run_logger()
+    live = os.getenv("SEND_LIVE", "0") == "1"
+    daily_cap = int(os.getenv("SEND_DAILY_CAP", "500"))
 
-    # --- Trip block (kept permanently for testing alerts) ---
-    trip = os.getenv("TRIP_SENDQ", "").strip().lower() in {"1", "true", "yes", "on"}
-    if trip:
-        reason = os.getenv("TRIP_SENDQ_REASON", "Manual trip for alert test")
-        raise RuntimeError(reason)
-    # --------------------------------------------------------
-
-    tz = zoneinfo.ZoneInfo(tz_name)
-    is_weekend = datetime.now(tz).weekday() >= 5  # 5=Sat, 6=Sun
-
-    if is_weekend and not allow_weekend:
-        log.info("Weekend guard active → skipping run (set allow_weekend=True to override).")
+    # simple weekend guard (UTC)
+    if not allow_weekend and datetime.now(timezone.utc).weekday() >= 5:
+        log.info("Weekend window closed; skipping.")
         return 0
 
-    queued = fetch_queued(batch_size)
-    if not queued:
-        log.info("No queued emails found.")
-        return 0
+    sent = 0
+    with SessionLocal() as s:
+        # cap check (only matters for live)
+        if live:
+            already = _sent_today(s)
+            if already >= daily_cap:
+                log.info(f"Daily cap reached ({already}/{daily_cap}); skipping.")
+                return 0
 
-    results = deliver(queued)
-    updated = persist_results(results)
-    log.info(f"Updated {updated} rows in email_sends.")
-    return updated
-PY
+        batch = _fetch_batch(s, batch_size)
+        if not batch:
+            log.info("No queued emails.")
+            return 0
+
+        for row in batch:
+            es_id, lead_id, email, send_type, subject, body = row
+
+            # jitter to avoid bursts
+            time.sleep(random.uniform(1.0, 3.5))
+
+            if not live:
+                log.info(f"DRY RUN — would send to {email} (email_sends.id={es_id})")
+                continue
+
+            # enforce cap mid-batch
+            if _sent_today(s) >= daily_cap:
+                log.info("Daily cap reached mid-batch; stopping early.")
+                break
+
+            try:
+                provider_message_id = _smtp_send(email, subject, body)
+                s.execute(
+                    update(email_sends)
+                    .where(email_sends.c.id == es_id)
+                    .values(status="sent", sent_at=func.now(), provider_message_id=provider_message_id)
+                )
+                sent += 1
+                s.commit()
+            except Exception as e:
+                s.execute(
+                    update(email_sends)
+                    .where(email_sends.c.id == es_id)
+                    .values(status="failed", error=str(e))
+                )
+                s.commit()
+                log.error(f"Failed to send to {email}: {e}")
+
+    log.info(f"Processed batch (live={live}); sent={sent}")
+    return sent

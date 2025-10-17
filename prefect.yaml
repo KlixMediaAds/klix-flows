@@ -1,66 +1,30 @@
-# Prefect 3 deployment config — Git-backed
-# Docs: https://docs.prefect.io/latest/deploy/infrastructure/managed
-
-# ---- GLOBALS (optional) ----
-# build: []          # (not needed for managed)
-# push: []           # (managed will clone Git itself)
+name: klix
+pull:
+  - prefect.deployments.steps.git_clone:
+      repository: https://github.com/KlixMediaAds/klix-flows.git
+      branch: main
 
 deployments:
-  # --- 1) bootstrap-db ---
-  - name: bootstrap-db
-    entrypoint: flows/bootstrap_db.py:bootstrap_db
-    storage:
-      type: git
-      repository: https://github.com/KlixMediaAds/klix-flows.git
-      reference: main
-      path: flows
-    work_pool:
-      name: klix-managed
-      job_variables:
-        # Packages the managed worker should pip install:
-        pip_packages:
-          - psycopg[binary]==3.2.1
-          - SQLAlchemy==2.0.36
-          - requests==2.32.3
-          - python-dotenv==1.0.1
-        # Environment passed to the run:
-        env:
-          DATABASE_URL: "postgresql://neondb_owner:npg_saKXL23rzgvI@ep-shiny-cloud-adpyimu9-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+  - name: lead-finder
+    entrypoint: flows/lead_finder_flow.py:lead_finder
+    work_pool: { name: klix-managed }
+    parameters: { count: 100 }
+    schedules:
+      - cron: "0 9 * * 1-5"
+        timezone: America/Toronto
 
-  # --- 2) demo-ingest ---
-  - name: demo-ingest
-    entrypoint: flows/demo_ingest.py:demo_ingest
-    storage:
-      type: git
-      repository: https://github.com/KlixMediaAds/klix-flows.git
-      reference: main
-      path: flows
-    work_pool:
-      name: klix-managed
-      job_variables:
-        pip_packages:
-          - psycopg[binary]==3.2.1
-          - SQLAlchemy==2.0.36
-          - requests==2.32.3
-          - python-dotenv==1.0.1
-        env:
-          DATABASE_URL: "postgresql://neondb_owner:npg_saKXL23rzgvI@ep-shiny-cloud-adpyimu9-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+  - name: email-builder
+    entrypoint: flows/email_builder_flow.py:email_builder
+    work_pool: { name: klix-managed }
+    parameters: { max_leads: 100, send_type: "friendly_then_cold" }
+    schedules:
+      - cron: "15 9 * * 1-5"
+        timezone: America/Toronto
 
-  # --- 3) real-ingest ---
-  - name: real-ingest
-    entrypoint: flows/real_ingest.py:real_ingest
-    storage:
-      type: git
-      repository: https://github.com/KlixMediaAds/klix-flows.git
-      reference: main
-      path: flows
-    work_pool:
-      name: klix-managed
-      job_variables:
-        pip_packages:
-          - psycopg[binary]==3.2.1
-          - SQLAlchemy==2.0.36
-          - requests==2.32.3
-          - python-dotenv==1.0.1
-        env:
-          DATABASE_URL: "postgresql://neondb_owner:npg_saKXL23rzgvI@ep-shiny-cloud-adpyimu9-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+  - name: send-queue
+    entrypoint: flows/send_queue.py:send_queue
+    work_pool: { name: klix-managed }
+    parameters: { batch_size: 25, allow_weekend: false }
+    schedules:
+      - cron: "*/30 9-17 * * 1-5"
+        timezone: America/Toronto
