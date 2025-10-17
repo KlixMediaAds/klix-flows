@@ -1,4 +1,4 @@
-﻿from prefect import flow, get_run_logger
+from prefect import flow, get_run_logger
 from klix.email_builder.main import build_for_new_leads
 
 @flow(name="email_builder")

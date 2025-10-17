@@ -1,0 +1,8 @@
+{
+  "weights": { "w_contraction": 0.22, "w_question": 0.18, "w_personal": 0.16, "w_wc_max": 0.28, "wc_ideal": 90, "wc_sigma": 18 },
+  "cta_buckets": {
+    "peek": ["Open to a 15s peek?", "Want a quick look?"],
+    "permission": ["Mind if I send two mini concepts?", "Okay if I share a tiny test?"],
+    "micro_commit": ["Should I send two tiny options?", "Want two small directions to compare?"]
+  }
+}

@@ -1,0 +1,7 @@
+﻿gspread
+PyYAML
+python-dotenv
+tzdata
+google-auth
+oauthlib
+requests

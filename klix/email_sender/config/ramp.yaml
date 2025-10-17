@@ -1,0 +1,20 @@
+# config/ramp.yml
+domains:
+  - id: klixads_1
+    from_email: jess@klixads.ca
+    warmup:
+      start_per_day: 10
+      step_per_day: 5
+      max_per_day: 60
+    promote_if:
+      max_bounce_pct: 2.0
+      min_reply_pct: 0.5
+    cooloff_if:
+      bounces_today_gte: 5
+
+  - id: klixmedia_1
+    from_email: erica@klixmedia.ca
+    warmup:
+      start_per_day: 10
+      step_per_day: 5
+      max_per_day: 60

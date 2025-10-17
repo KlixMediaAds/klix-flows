@@ -1,0 +1,60 @@
+angles:
+  - id: site-copy-hook
+    weight: 3
+    requires: []                # always safe
+    template_hint: "Open by paraphrasing their H1/tagline or About sentence; mention 1 product/scent."
+
+  - id: tone-mood-hook
+    weight: 3
+    requires: []
+    template_hint: "Lead with the vibe their photos/colors imply (calm, cozy, bright); propose a micro-scene that matches."
+
+  - id: product-hero-hook
+    weight: 2
+    requires: ["Products"]
+    template_hint: "Lift a specific SKU name from Products and pitch one intimate shot around it."
+
+  - id: social-activity-hook
+    weight: 2
+    requires: ["Instagram","LastPostDate"]
+    template_hint: "Reference recent posting rhythm (e.g., weekly reels) without judging cadence."
+
+  - id: process-bts-hook
+    weight: 2
+    requires: []
+    template_hint: "If they mention hand-poured, small-batch, roasting, etc., suggest a no-face process close-up."
+
+  - id: local-pride-hook
+    weight: 2
+    requires: ["City"]
+    template_hint: "Anchor in city/region; align the visual with local light/weather/landmarks (subtle, no stock cliches)."
+
+  - id: micro-gesture-hook
+    weight: 2
+    requires: []
+    template_hint: "Propose a single tactile gesture (snuffing a candle, peeling a wax seal, trimming a wick) with ASMR-lite audio."
+
+  - id: seasonal-hook
+    weight: 2
+    requires: ["Signals.Seasonal"]
+    template_hint: "Tie to a near-term moment (fall scents, holidays) with colors/props that fit."
+
+  - id: founder-story-hook
+    weight: 1
+    requires: ["Founder"]
+    template_hint: "If founder name appears, nod to their origin or reason for starting (one line, not a bio)."
+
+  - id: sustainability-ingredients-hook
+    weight: 1
+    requires: ["Notes|AboutLine"]
+    template_hint: "If soy/clean/vegan/ethical appears, frame a clean-materials visual without any health claims."
+
+  - id: workshop-class-hook
+    weight: 1
+    requires: ["Notes"]
+    template_hint: "If classes/workshops are offered, suggest a no-face table-top moment (tools laid out, hands-only)."
+
+  - id: review-gap-hook
+    weight: 1
+    requires: ["Signals.ReviewLight"]
+    template_hint: "Gently frame UGC as a way to give shoppers a ‘closer look’; absolutely no shaming."

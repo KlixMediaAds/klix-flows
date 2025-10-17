@@ -1,4 +1,4 @@
-﻿from prefect import flow, get_run_logger
+from prefect import flow, get_run_logger
 from klix.lead_finder.main import find_leads
 
 @flow(name="lead_finder")

@@ -1,0 +1,158 @@
+timezone: "America/Toronto"
+
+business_hours:
+  start: "09:00"
+  end: "17:30"
+  weekdays: [1,2,3,4,5]   # Mon=1..Sun=7
+
+sending:
+  GLOBAL_DAILY_CAP: 60
+  FRIENDLY_FRACTION: 0.40
+  DEDUPE_DAYS: 30
+  # Wider, more human pacing
+  MIN_DELAY_SEC: 45
+  MAX_DELAY_SEC: 120
+  SIGNATURE_ENABLED: true
+  DRY_RUN: false
+  # Safer bounce guard
+  BOUNCE_THRESHOLD: 0.05
+  BOUNCE_LOOKBACK: 50
+
+# Warmup ramp per FROM address (day-indexed caps). Day 0 = 5 sends.
+warmup:
+  ads.klix@gmail.com:  [5,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,45]
+  jess@klixads.ca:     [5,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,45]
+  alex@klixads.org:    [5,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,45]
+  erica@klixmedia.ca:  [5,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,45]
+  team@klixmedia.org:  [5,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,45]
+
+senders:
+  - id: ads
+    domain: klixads.ca
+    host: smtp.gmail.com
+    port: 587
+    username: ads.klix@gmail.com
+    app_password: ${GMAIL_APP_PASSWORD_ADS}
+    from_name: "Klix Media — Ads"
+    from_email: ads.klix@gmail.com
+    reply_to: ads@klixads.ca
+    daily_cap: 100
+    min_delay: 45
+    max_delay: 120
+    warmup_start: 2025-10-02
+    enabled: true
+
+  - id: jess
+    domain: klixads.ca
+    host: smtp.gmail.com
+    port: 587
+    username: jess@klixads.ca
+    app_password: ${GMAIL_APP_PASSWORD_JESS}
+    from_name: "Jess @ Klix Media"
+    from_email: jess@klixads.ca
+    reply_to: jess@klixads.ca
+    daily_cap: 100
+    min_delay: 45
+    max_delay: 120
+    warmup_start: 2025-10-02
+    enabled: true
+
+  - id: alex
+    domain: klixads.org
+    host: smtp.gmail.com
+    port: 587
+    username: alex@klixads.org
+    app_password: ${GMAIL_APP_PASSWORD_ALEX}
+    from_name: "Alex @ Klix Media"
+    from_email: alex@klixads.org
+    reply_to: alex@klixads.org
+    daily_cap: 100
+    min_delay: 45
+    max_delay: 120
+    warmup_start: 2025-10-02
+    enabled: true
+
+  - id: erica
+    domain: klixmedia.ca
+    host: smtp.gmail.com
+    port: 587
+    username: erica@klixmedia.ca
+    app_password: ${GMAIL_APP_PASSWORD_ERICA}
+    from_name: "Erica @ Klix Media"
+    from_email: erica@klixmedia.ca
+    reply_to: erica@klixmedia.ca
+    daily_cap: 100
+    min_delay: 45
+    max_delay: 120
+    warmup_start: 2025-10-02
+    enabled: true
+
+  - id: team
+    domain: klixmedia.org
+    host: smtp.gmail.com
+    port: 587
+    username: team@klixmedia.org
+    app_password: ${GMAIL_APP_PASSWORD_TEAM}
+    from_name: "Klix Media Team"
+    from_email: team@klixmedia.org
+    reply_to: team@klixmedia.org
+    daily_cap: 100
+    min_delay: 45
+    max_delay: 120
+    warmup_start: 2025-10-02
+    enabled: true
+
+# Subject diversification engine (used by app/sender_engine/subject.py)
+subjector:
+  enabled: true
+
+  apply_to:
+    cold: true
+    followups: true
+    friendlies: true
+
+  strategies:
+    - name: template
+      weight: 0.45
+    - name: spin
+      weight: 0.30
+    - name: interrogative   # NEW
+      weight: 0.15
+    - name: recycle_excerpt
+      weight: 0.10
+
+  followups:
+    reply_prefix_chance: 0.35
+    keep_thread_chance: 0.85  # prefer keeping thread; only break for last-touch/breakup
+
+    f1_prefixes: ["quick nudge", "circling back", "quick check", "gentle ping"]
+    f2_prefixes: ["still up for this?", "worth a look?", "2nd nudge", "looping back"]
+    f3_prefixes: ["last ping", "closing the loop", "parking this?", "final check"]
+
+  min_len: 18
+  max_len: 74
+  title_case_ratio: 0.35
+  sentence_case_ratio: 0.40
+  lowercase_ratio: 0.25
+  allow_punctuation: true
+  allow_emojis: true        # enable light emoji use
+
+  dedupe_window_days: 21
+  jaccard_ngram: 3
+  jaccard_min_diff: 0.22
+  db_path: "send_state.db"
+
+  pools:
+    channels: ["paid social", "Meta ads", "Google Ads", "search & social", "performance creative"]
+    benefits: ["cut CAC", "improve ROAS", "lower CPL", "increase pipeline", "book more demos", "lift revenue per lead"]
+    topics: ["creative testing", "lead quality", "attribution", "media efficiency", "landing pages"]
+    nudges: ["quick idea", "tiny thought", "two-line pitch", "sanity check", "fast one"]
+    pain_points: ["wasted ad spend", "inconsistent lead flow", "low-quality leads", "creative fatigue", "ad account bans"]  # NEW
+
+  banned:
+    - "free"
+    - "guaranteed"
+    - "risk-free"
+    - "act now"
+    - "limited time"
+    - "!!!"
