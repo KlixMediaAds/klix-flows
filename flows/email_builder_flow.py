@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import Optional, Dict
 from prefect import flow, get_run_logger
 from klix.email_builder.main import build_for_new_leads
 
@@ -9,6 +10,8 @@ def email_builder(
     # accept legacy deployment params but ignore them:
     max_leads: int = 100,
     send_type: str = "friendly_then_cold",
+    # accept old 'extras' param (optional) so server validation/execution is happy
+    extras: Optional[Dict] = None,
 ) -> int:
     log = get_run_logger()
     n = build_for_new_leads(limit=limit, mode=mode)
