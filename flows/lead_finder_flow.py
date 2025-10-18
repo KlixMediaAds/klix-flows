@@ -1,66 +1,35 @@
 from __future__ import annotations
-import os, importlib
-from typing import List, Dict, Any
+import os
 from prefect import flow, get_run_logger
 
-# DB upsert
+# Real leads from your Google Places finder adapter
+from klix.lead_finder.finders import find_leads
+# DB writer (dedupe_key + ON CONFLICT)
 from klix.lead_finder.main import upsert_leads_into_neon
 
-def _import_find_leads():
+@flow(name="lead_finder/lead-finder")
+def lead_finder(count: int = 25) -> int:
     """
-    Try to import an existing find_leads() from a few likely places.
-    Must return List[Dict[str,Any]] with keys like email, company, etc.
+    Discover leads with klix.lead_finder.finders.find_leads and write to Neon via upsert.
+    Idempotent via dedupe_key (sha1(email + "\\0" + company)).
     """
-    candidates = [
-        ("klix.lead_finder.finders", "find_leads"),
-        ("klix.lead_finder.main", "find_leads"),
-        ("flows.lead_finder", "find_leads"),
-    ]
-    for mod, fn in candidates:
-        try:
-            m = importlib.import_module(mod)
-            if hasattr(m, fn):
-                return getattr(m, fn)
-        except Exception:
-            pass
-
-    # Fallback seed for sanity
-    def seed(count: int = 1) -> List[Dict[str, Any]]:
-        return [{
-            "email": "owner@example.com",
-            "company": "TestCo",
-            "source": "seed",
-            "meta": {"seed": True},
-        }][:count]
-    return seed
-
-@flow(name="lead_finder")
-def run_lead_finder(count: int = 25) -> int:
-    """
-    Find leads and write them to Neon.leads with ON CONFLICT(dedupe_key) upsert.
-    Sheets writes are disabled in Phase 1 (DB-first).
-    """
-    logger = get_run_logger()
+    log = get_run_logger()
     sink = os.getenv("LEAD_FINDER_SINK", "neon").lower()
-    find_leads = _import_find_leads()
 
-    # Discover leads
-    items = find_leads(count=count) if "count" in getattr(find_leads, "__code__", lambda:None).__code__.co_varnames else find_leads()
-    if not isinstance(items, list):
-        logger.warning("find_leads() did not return a list; coercing to empty list.")
-        items = []
-    logger.info(f"discovered={len(items)} sink={sink}")
+    items = find_leads(count=count)
+    log.info(f"found {len(items)} items from adapter")
 
-    # Phase 1: only Neon writes
     written = 0
     if sink in ("neon", "both"):
         written = upsert_leads_into_neon(items)
-        logger.info(f"upserted_to_neon={written}")
-    else:
-        logger.info("LEAD_FINDER_SINK != neon; skipping Neon write by config")
+        log.info(f"upserted {written} items into Neon")
 
-    # (Sheets intentionally disabled in Phase 1)
+    # Sheets intentionally disabled for Phase 1
+    if sink == "sheets":
+        log.warning("LEAD_FINDER_SINK=sheets is ignored in Phase 1 (DB-first)")
+
     return written
 
 if __name__ == "__main__":
-    run_lead_finder()
+    # local smoke-run
+    print(lead_finder(5))
