@@ -7,7 +7,7 @@ from klix.lead_finder.finders import find_leads
 # DB writer (dedupe_key + ON CONFLICT)
 from klix.lead_finder.main import upsert_leads_into_neon
 
-@flow(name="lead_finder/lead-finder")
+@flow(name="lead_finder")
 def lead_finder(count: int = 25) -> int:
     """
     Discover leads with klix.lead_finder.finders.find_leads and write to Neon via upsert.
