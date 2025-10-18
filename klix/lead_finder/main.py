@@ -1,62 +1,53 @@
-﻿from datetime import datetime, timezone
-from typing import Dict, Any, List
-import csv, os
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-from flows.db import SessionLocal
-from flows.schema import leads
+from __future__ import annotations
+import hashlib
+from typing import Iterable, Dict, Any
+from datetime import datetime, timezone
 
-# EDIT THIS IMPORT if your function/file is named differently:
-try:
-    from klix.lead_finder.lead_finder_us import run_lead_finder  # expects list[dict] or None
-except Exception:
-    run_lead_finder = None
+from sqlalchemy import text
+from klix.db import engine
 
-def _load_from_csv(path: str) -> List[Dict[str, Any]]:
-    if not os.path.exists(path):
-        return []
-    out = []
-    with open(path, newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            out.append({
-                "email": row.get("email") or row.get("Email") or row.get("EMAIL"),
-                "company": row.get("company") or row.get("Company"),
-                "first_name": row.get("first_name") or row.get("FirstName") or row.get("First Name"),
-                "last_name": row.get("last_name") or row.get("LastName") or row.get("Last Name"),
-                "source": row.get("source") or "legacy_csv",
-                "meta": {k:v for k,v in row.items() if k.lower() not in {"email","company","first_name","last_name","source"}},
-            })
-    return [x for x in out if x["email"]]
+def _dk(email: str|None, company: str|None) -> str:
+    email = (email or "").strip().lower()
+    company = (company or "").strip()
+    return hashlib.sha1(f"{email}\0{company}".encode("utf-8")).hexdigest()
 
-def find_leads(target: int = 100) -> int:
-    rows: List[Dict[str, Any]] = []
-    if callable(run_lead_finder):
-        try:
-            rows = run_lead_finder(limit=target) or []
-        except TypeError:
-            rows = run_lead_finder() or []
-    if not rows:
-        rows = _load_from_csv(os.path.join(os.path.dirname(__file__), "leads_new.csv"))[:target]
-
-    now = datetime.now(timezone.utc)
-    inserted = 0
-    with SessionLocal() as s:
-        for row in rows:
-            stmt = (
-                pg_insert(leads)
-                .values(
-                    email=row["email"],
-                    company=row.get("company"),
-                    first_name=row.get("first_name"),
-                    last_name=row.get("last_name"),
-                    source=row.get("source","unknown"),
-                    discovered_at=now,
-                    meta=row.get("meta", {}),
-                )
-                .on_conflict_do_nothing(index_elements=["email"])
-            )
-            res = s.execute(stmt)
-            if res.rowcount:
-                inserted += 1
-        s.commit()
-    return inserted
+def upsert_leads_into_neon(items: Iterable[Dict[str, Any]]) -> int:
+    """
+    Inserts/updates leads into Neon.
+    - Computes dedupe_key = sha1(email + "\0" + company)
+    - ON CONFLICT: updates company, name fields, source, status; merges meta.
+    Returns number of attempted rows (skips items without an email).
+    """
+    attempted = 0
+    with engine.begin() as c:
+        for it in items:
+            email = (it.get("email") or "").strip().lower()
+            if not email:
+                continue
+            attempted += 1
+            company = (it.get("company") or "").strip()
+            params = {
+                "email": email,
+                "company": company or None,
+                "first_name": (it.get("first_name") or None),
+                "last_name": (it.get("last_name") or None),
+                "source": (it.get("source") or None),
+                "status": (it.get("status") or "NEW"),
+                "meta": (it.get("meta") or {}),
+                "discovered_at": (it.get("discovered_at") or datetime.now(timezone.utc)),
+                "dk": _dk(email, company),
+            }
+            c.execute(text("""
+                INSERT INTO public.leads
+                    (email, company, first_name, last_name, source, status, meta, discovered_at, dedupe_key)
+                VALUES
+                    (:email, :company, :first_name, :last_name, :source, :status, CAST(:meta AS jsonb), :discovered_at, :dk)
+                ON CONFLICT (dedupe_key) DO UPDATE
+                SET company = EXCLUDED.company,
+                    first_name = COALESCE(EXCLUDED.first_name, public.leads.first_name),
+                    last_name  = COALESCE(EXCLUDED.last_name,  public.leads.last_name),
+                    source     = COALESCE(EXCLUDED.source,     public.leads.source),
+                    status     = COALESCE(EXCLUDED.status,     public.leads.status),
+                    meta       = COALESCE(public.leads.meta, '{}'::jsonb) || COALESCE(EXCLUDED.meta, '{}'::jsonb)
+            """), params)
+    return attempted
