@@ -1,5 +1,5 @@
 from __future__ import annotations
-import hashlib
+import hashlib, json
 from typing import Iterable, Dict, Any
 from datetime import datetime, timezone
 
@@ -14,9 +14,9 @@ def _dk(email: str|None, company: str|None) -> str:
 def upsert_leads_into_neon(items: Iterable[Dict[str, Any]]) -> int:
     """
     Inserts/updates leads into Neon.
-    - Computes dedupe_key = sha1(email + "\0" + company)
-    - ON CONFLICT: updates company, name fields, source, status; merges meta.
-    Returns number of attempted rows (skips items without an email).
+    - dedupe_key = sha1(email + "\\0" + company)
+    - ON CONFLICT: update a few fields; merge meta as jsonb
+    Returns: number of attempted rows (skips rows lacking email)
     """
     attempted = 0
     with engine.begin() as c:
@@ -26,6 +26,7 @@ def upsert_leads_into_neon(items: Iterable[Dict[str, Any]]) -> int:
                 continue
             attempted += 1
             company = (it.get("company") or "").strip()
+            meta_json = json.dumps(it.get("meta") or {})
             params = {
                 "email": email,
                 "company": company or None,
@@ -33,7 +34,7 @@ def upsert_leads_into_neon(items: Iterable[Dict[str, Any]]) -> int:
                 "last_name": (it.get("last_name") or None),
                 "source": (it.get("source") or None),
                 "status": (it.get("status") or "NEW"),
-                "meta": (it.get("meta") or {}),
+                "meta_json": meta_json,
                 "discovered_at": (it.get("discovered_at") or datetime.now(timezone.utc)),
                 "dk": _dk(email, company),
             }
@@ -41,13 +42,13 @@ def upsert_leads_into_neon(items: Iterable[Dict[str, Any]]) -> int:
                 INSERT INTO public.leads
                     (email, company, first_name, last_name, source, status, meta, discovered_at, dedupe_key)
                 VALUES
-                    (:email, :company, :first_name, :last_name, :source, :status, CAST(:meta AS jsonb), :discovered_at, :dk)
+                    (:email, :company, :first_name, :last_name, :source, :status, CAST(:meta_json AS jsonb), :discovered_at, :dk)
                 ON CONFLICT (dedupe_key) DO UPDATE
-                SET company = EXCLUDED.company,
-                    first_name = COALESCE(EXCLUDED.first_name, public.leads.first_name),
-                    last_name  = COALESCE(EXCLUDED.last_name,  public.leads.last_name),
-                    source     = COALESCE(EXCLUDED.source,     public.leads.source),
-                    status     = COALESCE(EXCLUDED.status,     public.leads.status),
-                    meta       = COALESCE(public.leads.meta, '{}'::jsonb) || COALESCE(EXCLUDED.meta, '{}'::jsonb)
+                SET company   = EXCLUDED.company,
+                    first_name= COALESCE(EXCLUDED.first_name, public.leads.first_name),
+                    last_name = COALESCE(EXCLUDED.last_name,  public.leads.last_name),
+                    source    = COALESCE(EXCLUDED.source,     public.leads.source),
+                    status    = COALESCE(EXCLUDED.status,     public.leads.status),
+                    meta      = COALESCE(public.leads.meta, '{}'::jsonb) || COALESCE(EXCLUDED.meta, '{}'::jsonb)
             """), params)
     return attempted
