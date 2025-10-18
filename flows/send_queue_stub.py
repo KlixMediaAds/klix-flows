@@ -63,7 +63,7 @@ def persist_per_row(results: List[Dict]) -> int:
     with eng.begin() as cx:
         for r in results:
             cx.execute(
-                text("UPDATE email_sends SET status=:st, provider_message_id=:mid WHERE id=:id"),
+                text("UPDATE email_sends SET status=:st, provider_message_id=:mid, sent_at = CASE WHEN :st='sent' THEN now() ELSE sent_at END WHERE id=:id"),
                 {"st": r["status"], "mid": r["mid"], "id": r["send_id"]},
             )
             cnt += 1
