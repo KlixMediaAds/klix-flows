@@ -28,3 +28,20 @@ deployments:
     schedules:
       - cron: "*/30 9-17 * * 1-5"
         timezone: America/Toronto
+
+  - name: email-queue
+    entrypoint: flows/email_queue_flow.py:email_queue
+    work_pool:
+      name: klix-managed
+    storage:
+      repository: https://github.com/KlixMediaAds/klix-flows.git
+      reference: main
+      path: flows
+  - name: send-queue
+    entrypoint: flows/send_queue_stub.py:send_queue
+    work_pool:
+      name: klix-managed
+    storage:
+      repository: https://github.com/KlixMediaAds/klix-flows.git
+      reference: main
+      path: flows
