@@ -2,7 +2,6 @@ from __future__ import annotations
 import hashlib, json
 from typing import Iterable, Dict, Any
 from datetime import datetime, timezone
-
 from sqlalchemy import text
 from klix.db import engine
 
@@ -15,8 +14,8 @@ def upsert_leads_into_neon(items: Iterable[Dict[str, Any]]) -> int:
     """
     Inserts/updates leads into Neon.
     - dedupe_key = sha1(email + "\\0" + company)
-    - ON CONFLICT: update a few fields; merge meta as jsonb
-    Returns: number of attempted rows (skips rows lacking email)
+    - ON CONFLICT: update core fields; merge meta as jsonb.
+    Returns: number of attempted rows (skips rows lacking email).
     """
     attempted = 0
     with engine.begin() as c:
@@ -26,7 +25,6 @@ def upsert_leads_into_neon(items: Iterable[Dict[str, Any]]) -> int:
                 continue
             attempted += 1
             company = (it.get("company") or "").strip()
-            meta_json = json.dumps(it.get("meta") or {})
             params = {
                 "email": email,
                 "company": company or None,
@@ -34,7 +32,7 @@ def upsert_leads_into_neon(items: Iterable[Dict[str, Any]]) -> int:
                 "last_name": (it.get("last_name") or None),
                 "source": (it.get("source") or None),
                 "status": (it.get("status") or "NEW"),
-                "meta_json": meta_json,
+                "meta_json": json.dumps(it.get("meta") or {}),
                 "discovered_at": (it.get("discovered_at") or datetime.now(timezone.utc)),
                 "dk": _dk(email, company),
             }
