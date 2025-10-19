@@ -1,4 +1,3 @@
-# (paced Postmark sender)
 from __future__ import annotations
 import os, time, random
 from datetime import datetime, time as dtime
@@ -17,8 +16,10 @@ DEFAULT_DRY_RUN         = False
 def _parse_hours(span: str):
     a,b = span.split("-"); h1,m1 = map(int,a.split(":")); h2,m2 = map(int,b.split(":"))
     return dtime(h1,m1), dtime(h2,m2)
-def _in_window(now, start, end):
-    t = now.time(); return (t>=start and t<=end) if start<=end else (t>=start or t<=end)
+
+def _in_window(now: datetime, start: dtime, end: dtime) -> bool:
+    t = now.time()
+    return (t>=start and t<=end) if start<=end else (t>=start or t<=end)
 
 @task
 def fetch_queued(e, n, friendlies_first):
@@ -33,21 +34,22 @@ def fetch_queued(e, n, friendlies_first):
     return list(e.execute(text(sql), {"n": n}).mappings())
 
 @task
-def get_lead_email(e, lid): return e.execute(text("select email from leads where id=:id"), {"id": lid}).scalar()
+def get_lead_email(e, lead_id: int) -> str|None:
+    return e.execute(text("select email from leads where id=:id"), {"id": lead_id}).scalar()
 
 @task
-def mark_sent(e, sid, pmid):
+def mark_sent(e, send_id: int, provider_message_id: str):
     e.execute(text("""update email_sends
                          set status='sent', provider_message_id=:pmid, sent_at=now()
-                       where id=:id"""), {"pmid": pmid, "id": sid})
+                       where id=:id"""), {"pmid": provider_message_id, "id": send_id})
 
 @task
-def mark_failed(e, sid, reason):
+def mark_failed(e, send_id: int, reason: str):
     e.execute(text("""update email_sends
                          set status='failed', failure_reason=:r
-                       where id=:id"""), {"r": reason[:500], "id": sid})
+                       where id=:id"""), {"r": reason[:500], "id": send_id})
 
-def _send_via_postmark(api_token, frm, to, subject, html, text):
+def _send_via_postmark(api_token: str, frm: str, to: str, subject: str, html: str, text: str) -> str:
     import requests
     payload = {"From": frm, "To": to, "Subject": subject, "MessageStream": "outbound"}
     if html: payload["HtmlBody"] = html
@@ -59,15 +61,16 @@ def _send_via_postmark(api_token, frm, to, subject, html, text):
     return r.json().get("MessageID","")
 
 @task
-def dispatch_one(row, lead_email, from_email, pm_api, dry_run):
-    if dry_run: return True, "dry-run"
+def dispatch_one(row, lead_email: str, from_email: str, pm_api: str, dry_run: bool):
+    if dry_run:
+        return True, "dry-run"
     try:
         pmid = _send_via_postmark(pm_api, from_email, lead_email, row["subject"], row["body_html"], row["body_text"])
         return True, pmid
     except Exception as e:
         return False, str(e)
 
-@flow(name="send_queue/send-queue")
+@flow(name="send_queue")  # <— NO SLASH
 def send_queue(batch_size: int = DEFAULT_BATCH_SIZE,
                target_per_hour: int = DEFAULT_TARGET_PER_HOUR,
                jitter_extra_s: int = DEFAULT_JITTER_EXTRA_S,
@@ -75,6 +78,9 @@ def send_queue(batch_size: int = DEFAULT_BATCH_SIZE,
                business_hours: str = DEFAULT_BUSINESS_HOURS,
                friendlies_first: bool = DEFAULT_FRIENDLIES_FIRST,
                dry_run: bool = DEFAULT_DRY_RUN):
+    """
+    Drain up to batch_size queued emails with pacing, jitter, friendlies-first, and business-hours gating.
+    """
     log = get_run_logger()
     tz = ZoneInfo(timezone)
     start_t, end_t = _parse_hours(business_hours)
@@ -86,25 +92,34 @@ def send_queue(batch_size: int = DEFAULT_BATCH_SIZE,
     db_url = os.environ["DATABASE_URL"]
     from_email = os.environ.get("SENDER_FROM", "Klix <hello@klixads.org>")
     pm_api = os.environ.get("POSTMARK_API_TOKEN")
-    if not pm_api and not dry_run: raise RuntimeError("POSTMARK_API_TOKEN not set")
+    if not pm_api and not dry_run:
+        raise RuntimeError("POSTMARK_API_TOKEN not set")
 
     base_gap = max(1.0, 3600.0 / max(1, target_per_hour))
-
     e = create_engine(db_url).begin()
     rows = fetch_queued(e, batch_size, friendlies_first)
-    if not rows: log.info("No queued emails."); return 0
+    if not rows:
+        log.info("No queued emails.")
+        return 0
 
     sent = 0
-    for i,row in enumerate(rows,1):
+    for i, row in enumerate(rows, 1):
         to = get_lead_email(e, row["lead_id"])
         if not to:
-            mark_failed(e, row["id"], "lead email missing"); continue
+            mark_failed(e, row["id"], "lead email missing")
+            continue
+
         ok, info = dispatch_one(row, to, from_email, pm_api, dry_run)
-        if ok: mark_sent(e, row["id"], info); sent += 1
-        else:  mark_failed(e, row["id"], info)
+        if ok:
+            mark_sent(e, row["id"], info); sent += 1
+        else:
+            mark_failed(e, row["id"], info)
+
         if not dry_run and i < len(rows):
             time.sleep(base_gap + random.uniform(0, jitter_extra_s))
+
     log.info(f"Done. Sent {sent}/{len(rows)}.")
     return sent
 
-if __name__ == "__main__": send_queue()
+if __name__ == "__main__":
+    send_queue()
