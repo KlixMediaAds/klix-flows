@@ -1,10 +1,10 @@
 from prefect import flow, get_run_logger
 
 @flow(name="send_queue")
-def send_queue(batch_size: int = 25, allow_weekend: bool = False, **kwargs) -> int:
+def send_queue(batch_size: int = 25, allow_weekend: bool = False):
     """
     Wrapper that prefers the real sender if present.
-    Accepts allow_weekend and absorbs stray params to avoid SignatureMismatch.
+    Accepts 'allow_weekend' and falls back to a dry-run stub if the real impl is missing.
     """
     logger = get_run_logger()
     try:
@@ -18,8 +18,11 @@ def send_queue(batch_size: int = 25, allow_weekend: bool = False, **kwargs) -> i
         n = 0
         with eng.begin() as cx:
             rows = cx.execute(text("""
-              select id from email_sends where status='queued'
-              order by id asc limit :lim
+              select id
+                from email_sends
+               where status='queued'
+               order by id asc
+               limit :lim
             """), {"lim": batch_size}).mappings().all()
         for r in rows:
             with eng.begin() as cx:
