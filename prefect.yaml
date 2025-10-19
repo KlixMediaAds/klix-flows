@@ -24,3 +24,14 @@ deployments:
     dry_run: false
   schedules:
   - interval: 600.0   # every 10 minutes
+
+- name: email-builder
+  entrypoint: "flows/email_builder_flow.py:email_builder"
+  version: "{{ git_sha }}"
+  work_pool:
+    name: klix-managed
+    job_variables: {}
+  tags: ["build"]
+  parameters:
+    limit: 25
+    friendlies_domains: ["klixads.org"]   # tweak as you like
