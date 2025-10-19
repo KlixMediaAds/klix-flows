@@ -1,125 +1,132 @@
 from __future__ import annotations
-import os, time, random
+import time, random
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
-from prefect import flow, get_run_logger, task
-from sqlalchemy import create_engine, text
+from typing import List, Dict
 
-DEFAULT_TARGET_PER_HOUR = 40
-DEFAULT_JITTER_EXTRA_S  = 20
-DEFAULT_TZ              = "America/Toronto"
-DEFAULT_BUSINESS_HOURS  = "09:00-17:00"
-DEFAULT_BATCH_SIZE      = 25
-DEFAULT_FRIENDLIES_FIRST= True
-DEFAULT_DRY_RUN         = False
+from prefect import flow, task, get_run_logger
+from prefect.tasks import NO_CACHE
+from sqlalchemy import text
 
-def _parse_hours(span: str):
-    a,b = span.split("-"); h1,m1 = map(int,a.split(":")); h2,m2 = map(int,b.split(":"))
-    return dtime(h1,m1), dtime(h2,m2)
+from flows.db import get_engine  # single source of engine
+
+# ---------- pacing / window helpers ----------
+def _parse_hours(span: str) -> tuple[dtime, dtime]:
+    a, b = span.split("-")
+    h1, m1 = map(int, a.split(":"))
+    h2, m2 = map(int, b.split(":"))
+    return dtime(h1, m1), dtime(h2, m2)
 
 def _in_window(now: datetime, start: dtime, end: dtime) -> bool:
     t = now.time()
-    return (t>=start and t<=end) if start<=end else (t>=start or t<=end)
+    return (start <= t <= end) if start <= end else (t >= start or t <= end)
 
-@task
-def fetch_queued(e, n, friendlies_first):
-    order = "case when send_type='friendly' then 0 else 1 end, id" if friendlies_first else "id"
-    sql = f"""select id, lead_id, send_type, subject,
-                     coalesce(body_html,'') body_html,
-                     coalesce(body_text,'') body_text
-                from email_sends
-               where status='queued'
-            order by {order}
-               limit :n"""
-    return list(e.execute(text(sql), {"n": n}).mappings())
-
-@task
-def get_lead_email(e, lead_id: int) -> str|None:
-    return e.execute(text("select email from leads where id=:id"), {"id": lead_id}).scalar()
-
-@task
-def mark_sent(e, send_id: int, provider_message_id: str):
-    e.execute(text("""update email_sends
-                         set status='sent', provider_message_id=:pmid, sent_at=now()
-                       where id=:id"""), {"pmid": provider_message_id, "id": send_id})
-
-@task
-def mark_failed(e, send_id: int, reason: str):
-    e.execute(text("""update email_sends
-                         set status='failed', failure_reason=:r
-                       where id=:id"""), {"r": reason[:500], "id": send_id})
-
-def _send_via_postmark(api_token: str, frm: str, to: str, subject: str, html: str, text: str) -> str:
-    import requests
-    payload = {"From": frm, "To": to, "Subject": subject, "MessageStream": "outbound"}
-    if html: payload["HtmlBody"] = html
-    if text: payload["TextBody"] = text
-    r = requests.post("https://api.postmarkapp.com/email",
-                      json=payload,
-                      headers={"X-Postmark-Server-Token": api_token, "Accept": "application/json"})
-    r.raise_for_status()
-    return r.json().get("MessageID","")
-
-@task
-def dispatch_one(row, lead_email: str, from_email: str, pm_api: str, dry_run: bool):
-    if dry_run:
-        return True, "dry-run"
-    try:
-        pmid = _send_via_postmark(pm_api, from_email, lead_email, row["subject"], row["body_html"], row["body_text"])
-        return True, pmid
-    except Exception as e:
-        return False, str(e)
-
-@flow(name="send_queue")  # <— NO SLASH
-def send_queue(batch_size: int = DEFAULT_BATCH_SIZE,
-               target_per_hour: int = DEFAULT_TARGET_PER_HOUR,
-               jitter_extra_s: int = DEFAULT_JITTER_EXTRA_S,
-               timezone: str = DEFAULT_TZ,
-               business_hours: str = DEFAULT_BUSINESS_HOURS,
-               friendlies_first: bool = DEFAULT_FRIENDLIES_FIRST,
-               dry_run: bool = DEFAULT_DRY_RUN):
+# ---------- tasks (NO DB OBJECTS AS PARAMS) ----------
+@task(name="fetch_queued", cache_policy=NO_CACHE)
+def fetch_queued(batch_size: int, friendlies_first: bool) -> List[Dict]:
     """
-    Drain up to batch_size queued emails with pacing, jitter, friendlies-first, and business-hours gating.
+    Pull up to N queued emails with join to leads.
+    """
+    order_clause = "s.id ASC"
+    if friendlies_first:
+        # very simple 'friendly' boost example; tweak as needed
+        order_clause = ("(CASE WHEN LOWER(l.company) LIKE '%spa%' "
+                        "OR LOWER(l.company) LIKE '%salon%' THEN 0 ELSE 1 END), s.id ASC")
+
+    sql = f"""
+    SELECT s.id AS send_id, s.lead_id, s.subject, s.body,
+           l.email, l.company
+    FROM email_sends s
+    JOIN leads l ON l.id = s.lead_id
+    WHERE s.status = 'queued'
+    ORDER BY {order_clause}
+    LIMIT :n
+    """
+    eng = get_engine()
+    with eng.begin() as cx:
+        rows = cx.execute(text(sql), {"n": batch_size}).mappings().all()
+    return [dict(r) for r in rows]
+
+@task(name="deliver", cache_policy=NO_CACHE)
+def deliver(batch: List[Dict], dry_run: bool) -> List[Dict]:
+    """
+    Send (or simulate) one-by-one; return status records for persistence.
+    Replace the stub with your real provider when ready.
+    """
+    results: List[Dict] = []
+    for item in batch:
+        if dry_run:
+            msg_id = f"dry-{int(time.time())}"
+            status = "sent"     # simulated success
+        else:
+            # TODO: call real provider here
+            msg_id = f"mock-{int(time.time())}"
+            status = "sent"
+        results.append({"send_id": item["send_id"], "status": status, "message_id": msg_id})
+    return results
+
+@task(name="persist_results", cache_policy=NO_CACHE)
+def persist_results(results: List[Dict]) -> int:
+    eng = get_engine()
+    with eng.begin() as cx:
+        for r in results:
+            cx.execute(
+                text("""
+                  UPDATE email_sends
+                  SET status = :status, provider_message_id = :msg
+                  WHERE id = :id
+                """),
+                {"status": r["status"], "msg": r["message_id"], "id": r["send_id"]},
+            )
+    return len(results)
+
+# ---------- flow ----------
+@flow(name="send_queue")
+def send_queue(
+    batch_size: int = 25,
+    target_per_hour: int = 40,
+    jitter_extra_s: int = 20,
+    timezone: str = "America/Toronto",
+    business_hours: str = "09:00-17:00",
+    friendlies_first: bool = True,
+    dry_run: bool = False,
+    allow_weekend: bool = False,
+) -> int:
+    """
+    Drain queued emails with pacing + business-hours gating.
     """
     log = get_run_logger()
     tz = ZoneInfo(timezone)
     start_t, end_t = _parse_hours(business_hours)
+
     now = datetime.now(tz)
-    if not _in_window(now, start_t, end_t) and not dry_run:
-        log.info(f"Outside business hours {business_hours} {timezone}; exiting.")
+    if not allow_weekend and now.weekday() >= 5:
+        log.info("Weekend; skipping run.")
+        return 0
+    if not _in_window(now, start_t, end_t):
+        log.info("Outside business hours; skipping run.")
         return 0
 
-    db_url = os.environ["DATABASE_URL"]
-    from_email = os.environ.get("SENDER_FROM", "Klix <hello@klixads.org>")
-    pm_api = os.environ.get("POSTMARK_API_TOKEN")
-    if not pm_api and not dry_run:
-        raise RuntimeError("POSTMARK_API_TOKEN not set")
-
-    base_gap = max(1.0, 3600.0 / max(1, target_per_hour))
-    e = create_engine(db_url).begin()
-    rows = fetch_queued(e, batch_size, friendlies_first)
-    if not rows:
-        log.info("No queued emails.")
+    batch = fetch_queued(batch_size, friendlies_first)
+    if not batch:
+        log.info("No queued emails found.")
         return 0
 
-    sent = 0
-    for i, row in enumerate(rows, 1):
-        to = get_lead_email(e, row["lead_id"])
-        if not to:
-            mark_failed(e, row["id"], "lead email missing")
-            continue
-
-        ok, info = dispatch_one(row, to, from_email, pm_api, dry_run)
-        if ok:
-            mark_sent(e, row["id"], info); sent += 1
+    # Pace sends: one-at-a-time to respect target_per_hour + jitter
+    spacing = max(1, int(3600 / max(1, target_per_hour)))
+    sent_total = 0
+    for row in batch:
+        results = deliver([row], dry_run)
+        if not dry_run:
+            sent_total += persist_results(results)
         else:
-            mark_failed(e, row["id"], info)
+            log.info(f"DRY-RUN would mark send_id={row['send_id']} as 'sent'")
+        sleep_s = spacing + random.randint(0, max(0, jitter_extra_s))
+        log.info(f"Pacing sleep {sleep_s}s")
+        time.sleep(sleep_s)
 
-        if not dry_run and i < len(rows):
-            time.sleep(base_gap + random.uniform(0, jitter_extra_s))
-
-    log.info(f"Done. Sent {sent}/{len(rows)}.")
-    return sent
-
-if __name__ == "__main__":
-    send_queue()
+    if dry_run:
+        log.info("Dry-run mode; no DB updates persisted.")
+        return 0
+    log.info(f"Updated {sent_total} email_sends rows.")
+    return sent_total
