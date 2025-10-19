@@ -22,4 +22,5 @@ def send(to, subject, body):
         s.ehlo()
         s.login(USER, PASS)
         s.send_message(msg)
+
     return msg["Message-ID"]
