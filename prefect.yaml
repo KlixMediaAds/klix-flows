@@ -1,47 +1,26 @@
-name: klix
+name: klix-flows
+prefect-version: ">=3.0.0"
+
 pull:
-  - prefect.deployments.steps.git_clone:
-      repository: https://github.com/KlixMediaAds/klix-flows.git
-      branch: main
+- prefect.deployments.steps.git_clone:
+    repository: "https://github.com/KlixMediaAds/klix-flows.git"
+    branch: "main"
 
 deployments:
-  - name: lead-finder
-    entrypoint: flows/lead_finder_flow.py:lead_finder
-    work_pool: { name: klix-managed }
-    parameters: { count: 100 }
-    schedules:
-      - cron: "0 9 * * 1-5"
-        timezone: America/Toronto
-
-  - name: email-builder
-    entrypoint: flows/email_builder_flow.py:email_builder
-    work_pool: { name: klix-managed }
-    parameters: { max_leads: 100, send_type: "friendly_then_cold" }
-    schedules:
-      - cron: "15 9 * * 1-5"
-        timezone: America/Toronto
-
-  - name: send-queue
-    entrypoint: flows/send_queue.py:send_queue
-    work_pool: { name: klix-managed }
-    parameters: { batch_size: 25, allow_weekend: false }
-    schedules:
-      - cron: "*/30 9-17 * * 1-5"
-        timezone: America/Toronto
-
-  - name: email-queue
-    entrypoint: flows/email_queue_flow.py:email_queue
-    work_pool:
-      name: klix-managed
-    storage:
-      repository: https://github.com/KlixMediaAds/klix-flows.git
-      reference: main
-      path: flows
-  - name: send-queue
-    entrypoint: flows/send_queue_stub.py:send_queue
-    work_pool:
-      name: klix-managed
-    storage:
-      repository: https://github.com/KlixMediaAds/klix-flows.git
-      reference: main
-      path: flows
+- name: send-queue
+  entrypoint: "flows/send_queue.py:send_queue"
+  version: "{{ git_sha }}"
+  work_pool:
+    name: klix-managed
+    job_variables: {}
+  tags: ["send"]
+  parameters:
+    batch_size: 25
+    target_per_hour: 30
+    jitter_extra_s: 20
+    business_hours: "09:00-17:00"
+    timezone: "America/Toronto"
+    friendlies_first: true
+    dry_run: false
+  schedules:
+  - interval: 600.0   # every 10 minutes
