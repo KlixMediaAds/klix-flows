@@ -1,33 +1,25 @@
-import os, smtplib, ssl, uuid
+import os, smtplib
 from email.message import EmailMessage
+from email.utils import make_msgid
 
-def _gen_message_id(from_addr: str) -> str:
-    domain = (from_addr or "klix.local").split("@")[-1]
-    return f"<klix-{uuid.uuid4()}@{domain}>"
+HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+PORT = int(os.getenv("SMTP_PORT", "587"))
+USER = os.environ["SMTP_USER"]
+PASS = os.environ["SMTP_PASS"]
+FROM = os.environ["EMAIL_FROM"]
 
-def send(to: str, subject: str, body: str) -> str:
-    host = os.getenv("SMTP_HOST", "smtp.gmail.com")
-    port = int(os.getenv("SMTP_PORT", "587"))
-    user = os.environ["SMTP_USER"]          # full Gmail/Workspace address
-    pwd  = os.environ["SMTP_PASS"]          # Gmail App Password (NOT your login)
-    from_addr = os.getenv("EMAIL_FROM", user)
-    reply_to  = os.getenv("REPLY_TO", "")
-
+def send(to, subject, body):
     msg = EmailMessage()
-    msg["From"] = from_addr
+    msg["From"] = FROM
     msg["To"] = to
     msg["Subject"] = subject
-    msg["Message-ID"] = _gen_message_id(from_addr)
-    if reply_to:
-        msg["Reply-To"] = reply_to
+    msg["Message-ID"] = make_msgid(domain=USER.split("@")[-1])
     msg.set_content(body)
 
-    ctx = ssl.create_default_context()
-    with smtplib.SMTP(host, port, timeout=30) as s:
+    with smtplib.SMTP(HOST, PORT, timeout=30) as s:
         s.ehlo()
-        s.starttls(context=ctx)
+        s.starttls()
         s.ehlo()
-        s.login(user, pwd)
+        s.login(USER, PASS)
         s.send_message(msg)
-
     return msg["Message-ID"]
