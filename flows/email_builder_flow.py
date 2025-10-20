@@ -1,114 +1,83 @@
 from __future__ import annotations
-import os
-from typing import Optional, Tuple
+import os, itertools
+from typing import List, Dict, Any
 from prefect import flow, get_run_logger
 from sqlalchemy import create_engine, text
+from klix.email_builder.main import build_email_for_lead
 
-def get_engine():
-    url = os.environ["DATABASE_URL"]
-    return create_engine(url, pool_pre_ping=True)
+def _engine():
+    return create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True)
 
-def _table_columns(conn, table: str) -> set[str]:
-    rows = conn.execute(text("""
-        select column_name
-          from information_schema.columns
-         where table_name = :t
-           and table_schema = current_schema()
-    """), {"t": table}).all()
-    return {r[0] for r in rows}
+def _fetch_candidates(limit: int) -> List[Dict[str, Any]]:
+    """
+    Grab a generous slab of the freshest NEW/READY leads that do not
+    already have any email_sends row (any send_type). Filter by domain later.
+    """
+    e = _engine()
+    with e.begin() as c:
+        rows = list(c.execute(text("""
+            select id, email, company, source, status, discovered_at
+              from leads l
+             where status in ('NEW','READY')
+               and not exists (
+                   select 1 from email_sends s where s.lead_id = l.id
+               )
+             order by discovered_at desc
+             limit :lim
+        """), {"lim": max(limit * 5, 50)}).mappings())
+    return [dict(r) for r in rows]
 
-def _leads_to_build(conn, limit: int):
-    # Leads with an email and no existing email_sends row (queued or sent)
-    return list(conn.execute(text("""
-        select l.id, l.email, l.company, l.website, l.first_name, l.last_name
-          from leads l
-         where l.email is not null
-           and not exists (
-                 select 1 from email_sends s
-                  where s.lead_id = l.id
-           )
-      order by l.id asc
-         limit :n
-    """), {"n": limit}).mappings())
-
-def _insert_send(conn, cols: set[str], lead: dict,
-                 subject: str, html: Optional[str], text_body: Optional[str],
-                 send_type: str):
-    # Build an INSERT that only references columns that exist
-    fields = ["lead_id", "send_type", "status", "subject"]
-    values = { "lead_id": lead["id"], "send_type": send_type, "status": "queued", "subject": subject }
-
-    if "body_html" in cols:
-        fields.append("body_html"); values["body_html"] = html or ""
-    if "body_text" in cols:
-        fields.append("body_text"); values["body_text"] = text_body or ""
-
-    cols_sql = ", ".join(fields)
-    params_sql = ", ".join([f":{k}" for k in fields])
-    conn.execute(text(f"insert into email_sends ({cols_sql}) values ({params_sql})"), values)
-
-def _fallback_copy(lead: dict) -> Tuple[str, Optional[str], str, str]:
-    # subject, html, text, send_type
-    subj = f"{(lead.get('company') or 'Your site')}: quick idea to boost inquiries"
-    name = lead.get("first_name") or (lead.get("company") or "there")
-    site = (lead.get("website") or "").strip() or "your site"
-    text = (
-        f"Hey {name},\n\n"
-        f"I took a quick look at {site} and have a small test worth trying. "
-        f"If it flops, I’ll jot what I learned; if it works, you’ll see more inquiries.\n\n"
-        f"– Josh @ Klix"
-    )
-    return subj, None, text, "cold"
+def _domain(addr: str) -> str:
+    if not addr or "@" not in addr: return ""
+    return addr.rsplit("@", 1)[1].lower().strip()
 
 @flow(name="email_builder")
-def email_builder(limit: int = 25, friendlies_domains: list[str] | None = None):
+def email_builder(limit: int = 25,
+                  friendlies_domains: List[str] | None = None):
     """
-    Build and queue up to `limit` emails.
-    - Uses klix.email_builder.main.build_email_for_lead(lead) if available,
-      falling back to a simple human-ish template.
-    - Writes only the columns that exist in email_sends (schema-aware).
-    - Marks new rows as status='queued'.
+    Queues emails into email_sends based on leads + builder.
+    - Respects idempotency via (lead_id, send_type) unique key.
+    - Inserts into columns: (lead_id, send_type, status='queued', subject, body).
     """
-    log = get_run_logger()
-    friendlies_domains = [d.lower() for d in (friendlies_domains or [])]
+    logger = get_run_logger()
+    friendlies_domains = friendlies_domains or ["klixads.org", "gmail.com"]
+    domains_set = {d.lower() for d in friendlies_domains}
 
-    # Try to import the user's real builder
-    builder_fn = None
-    try:
-        from klix.email_builder.main import build_email_for_lead  # type: ignore
-        builder_fn = build_email_for_lead
-        log.info("Using klix.email_builder.main.build_email_for_lead")
-    except Exception as e:
-        log.warning(f"Real builder not found; using fallback. ({type(e).__name__}: {e})")
+    candidates = _fetch_candidates(limit)
+    logger.info(f"Fetched {len(candidates)} candidate leads")
 
-    eng = get_engine()
-    built = 0
-    with eng.begin() as conn:
-        cols = _table_columns(conn, "email_sends")
-        leads = _leads_to_build(conn, limit)
-        if not leads:
-            log.info("No leads to build.")
-            return 0
-
-        for lead in leads:
+    queued = 0
+    e = _engine()
+    with e.begin() as c:
+        for lead in candidates:
+            dom = _domain(lead.get("email", ""))
+            # Only queue friendlies for this deployment’s default path
+            if dom not in domains_set:
+                continue
             try:
-                if builder_fn:
-                    subject, html, text_body, send_type = builder_fn(lead)  # expected signature
-                else:
-                    subject, html, text_body, send_type = _fallback_copy(lead)
+                subject, body_text, body_html, send_type = build_email_for_lead(lead)
+            except Exception as ex:
+                logger.exception(f"Builder failed for lead {lead.get('id')}: {ex}")
+                continue
 
-                # Friendlies-first override by domain match
-                dom = (lead["email"].split("@", 1)[-1] or "").lower()
-                if dom in friendlies_domains:
-                    send_type = "friendly"
+            # prefer plain text column 'body' (your schema enforces NOT NULL on it)
+            c.execute(text("""
+                insert into email_sends (lead_id, send_type, status, subject, body)
+                values (:lid, :stype, 'queued', :subj, :body)
+                on conflict (lead_id, send_type) do nothing
+            """), {
+                "lid": lead["id"],
+                "stype": send_type,
+                "subj": subject,
+                "body": body_text or "",
+            })
+            # Check if insert actually happened
+            inserted = c.execute(text("""
+                select 1 from email_sends where lead_id=:lid and send_type=:stype
+            """), {"lid": lead["id"], "stype": send_type}).scalar()
+            if inserted:
+                queued += 1
+            if queued >= limit:
+                break
 
-                _insert_send(conn, cols, lead, subject, html, text_body, send_type)
-                built += 1
-            except Exception as e:
-                log.error(f"Failed to build for lead {lead['id']}: {e}")
-
-    log.info(f"Queued {built} emails.")
-    return built
-
-if __name__ == "__main__":
-    email_builder()
+    logger.info(f"Queued {queued} emails.")
