@@ -1,83 +1,94 @@
 from __future__ import annotations
-import os, itertools
 from typing import List, Dict, Any
+import os
 from prefect import flow, get_run_logger
 from sqlalchemy import create_engine, text
 from klix.email_builder.main import build_email_for_lead
 
 def _engine():
-    return create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True)
+    url = os.environ["DATABASE_URL"]
+    return create_engine(url, pool_pre_ping=True)
 
-def _fetch_candidates(limit: int) -> List[Dict[str, Any]]:
-    """
-    Grab a generous slab of the freshest NEW/READY leads that do not
-    already have any email_sends row (any send_type). Filter by domain later.
-    """
+def _existing_columns(conn, table: str) -> set[str]:
+    rows = conn.execute(text("""
+        select column_name
+          from information_schema.columns
+         where table_name = :t
+           and table_schema = current_schema()
+    """), {"t": table}).all()
+    return {r[0] for r in rows}
+
+def _fetch_candidates(limit: int) -> list[dict]:
     e = _engine()
     with e.begin() as c:
         rows = list(c.execute(text("""
-            select id, email, company, source, status, discovered_at
+            select id, email, company, website, first_name, last_name, status, discovered_at
               from leads l
-             where status in ('NEW','READY')
-               and not exists (
-                   select 1 from email_sends s where s.lead_id = l.id
-               )
-             order by discovered_at desc
+             where coalesce(email,'') <> ''
+               and not exists (select 1 from email_sends s where s.lead_id = l.id)
+             order by discovered_at desc nulls last, id desc
              limit :lim
-        """), {"lim": max(limit * 5, 50)}).mappings())
+        """), {"lim": max(5*limit, 50)}).mappings())
     return [dict(r) for r in rows]
 
-def _domain(addr: str) -> str:
-    if not addr or "@" not in addr: return ""
-    return addr.rsplit("@", 1)[1].lower().strip()
-
 @flow(name="email_builder")
-def email_builder(limit: int = 25,
-                  friendlies_domains: List[str] | None = None):
+def email_builder(limit: int = 60, friendlies_domains: List[str] | None = None):
     """
-    Queues emails into email_sends based on leads + builder.
-    - Respects idempotency via (lead_id, send_type) unique key.
-    - Inserts into columns: (lead_id, send_type, status='queued', subject, body).
+    Queue ALL eligible leads. Send type:
+      - 'friendly' if domain in friendlies_domains, else 'cold'
+    Inserts status='queued' and writes into body_text/body_html if present; falls back to body.
     """
     logger = get_run_logger()
     friendlies_domains = friendlies_domains or ["klixads.org", "gmail.com"]
-    domains_set = {d.lower() for d in friendlies_domains}
+    friendly_set = {d.lower() for d in friendlies_domains}
 
-    candidates = _fetch_candidates(limit)
-    logger.info(f"Fetched {len(candidates)} candidate leads")
+    cands = _fetch_candidates(limit)
+    logger.info(f"Fetched {len(cands)} candidate leads")
 
     queued = 0
-    e = _engine()
-    with e.begin() as c:
-        for lead in candidates:
-            dom = _domain(lead.get("email", ""))
-            # Only queue friendlies for this deployment’s default path
-            if dom not in domains_set:
-                continue
+    eng = _engine()
+    with eng.begin() as conn:
+        cols = _existing_columns(conn, "email_sends")
+        use_text = "body_text" in cols
+        use_html = "body_html" in cols
+        use_body = "body" in cols and not (use_text or use_html)  # only if legacy
+
+        for lead in cands:
+            email = (lead.get("email") or "").strip()
+            dom = email.split("@",1)[1].lower() if "@" in email else ""
             try:
-                subject, body_text, body_html, send_type = build_email_for_lead(lead)
+                subj, body_text, body_html, st_guess = build_email_for_lead(lead)
             except Exception as ex:
-                logger.exception(f"Builder failed for lead {lead.get('id')}: {ex}")
+                logger.warning(f"Builder failed for lead {lead.get('id')}: {ex}")
                 continue
 
-            # prefer plain text column 'body' (your schema enforces NOT NULL on it)
-            c.execute(text("""
-                insert into email_sends (lead_id, send_type, status, subject, body)
-                values (:lid, :stype, 'queued', :subj, :body)
-                on conflict (lead_id, send_type) do nothing
-            """), {
-                "lid": lead["id"],
-                "stype": send_type,
-                "subj": subject,
-                "body": body_text or "",
-            })
-            # Check if insert actually happened
-            inserted = c.execute(text("""
+            send_type = st_guess or ("friendly" if dom in friendly_set else "cold")
+            fields = ["lead_id", "send_type", "status", "subject"]
+            params = {"lead_id": lead["id"], "send_type": send_type, "status": "queued", "subject": (subj or "").strip()}
+
+            # put bodies in the right columns
+            if use_text:
+                fields.append("body_text"); params["body_text"] = (body_text or "").strip()
+            elif use_body:
+                fields.append("body");      params["body"]      = (body_text or "").strip()
+            if use_html and (body_html or "").strip():
+                fields.append("body_html"); params["body_html"] = body_html.strip()
+
+            placeholders = ",".join(f":{k}" for k in fields)
+            sql = f"""
+              insert into email_sends ({','.join(fields)}) values ({placeholders})
+              on conflict (lead_id, send_type) do nothing
+            """
+            conn.execute(text(sql), params)
+
+            # confirm the row exists (idempotent)
+            ok = conn.execute(text("""
                 select 1 from email_sends where lead_id=:lid and send_type=:stype
-            """), {"lid": lead["id"], "stype": send_type}).scalar()
-            if inserted:
+            """), {"lid": lead["id"], "stype": send_type}).fetchone()
+            if ok:
                 queued += 1
-            if queued >= limit:
-                break
+                if queued >= limit:
+                    break
 
     logger.info(f"Queued {queued} emails.")
+    return queued
