@@ -73,13 +73,14 @@ def send_queue(batch_size=25, allow_weekend=True):
         if sent_today >= DAILY_CAP:
             break
         subj = r["subject"] or ""
+        san = (r.get('body') or '')[:160].replace('\n',' ')
+        logger = get_run_logger()
+        logger.info('MAIL_PREVIEW id=%s to=%s subj=%r body=%r', r['send_id'], r['email'], (subj or '')[:72], san)
         body = r["body"] or ""
         to   = r["email"]
 
         san = (body or '')[:160]
         san = san.replace('\n',' ')
-        logger.info(f"MAIL_PREVIEW id={r['send_id']} to={to} subj={(subj or '')[:72]!r} body={san!r}")
-
         try:
             if LIVE:
                 _send_raw(to, subj, body)
