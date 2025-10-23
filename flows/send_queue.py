@@ -14,8 +14,7 @@ SMTP_PASS = os.getenv("SMTP_PASS") or os.getenv("SMTP_APP") or os.getenv("GMAIL_
 FROM_ADDR = os.getenv("SMTP_FROM") or SMTP_USER
 
 DAILY_CAP = int(os.getenv("SEND_DAILY_CAP","50"))
-LIVE = os.getenv("SEND_LIVE","1") == "1"
-try:
+LIVE = os.getenv('SEND_LIVE','1') == '1'try:
     if 'dry_run' in kwargs:
         LIVE = not bool(kwargs.get('dry_run'))
 except Exception:
@@ -49,9 +48,16 @@ def _send_raw(to_email: str, subject: str, body_text: str, body_html: str | None
     with _smtp() as s:
         s.sendmail(msg["From"], [to_email], msg.as_string())
 
-def send_queue(batch_size=25, allow_weekend=True):
+def send_queue(batch_size=25, allow_weekend=True, **kwargs):
     logger = get_run_logger()
-    if not allow_weekend and datetime.utcnow().weekday()>=5:
+    live = os.getenv('SEND_LIVE','1') == '1'
+    if isinstance(kwargs, dict) and 'dry_run' in kwargs:
+        try:
+            live = not bool(kwargs.get('dry_run'))
+        except Exception:
+            pass
+    logger.info(f'RUN_CONFIG live={live} kwargs={list(kwargs.keys())}')
+if not allow_weekend and datetime.utcnow().weekday()>=5:
         logger.info("Outside weekday window; exiting.")
         return 0
     if not within_window():
@@ -82,7 +88,7 @@ def send_queue(batch_size=25, allow_weekend=True):
         san = (body or '')[:160]
         san = san.replace('\n',' ')
         try:
-            if LIVE:
+            if live:
                 _send_raw(to, subj, body)
                 mid = "smtp"
             else:
