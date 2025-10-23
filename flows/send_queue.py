@@ -7,22 +7,19 @@ from prefect import get_run_logger
 
 ENG = create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True, future=True)
 
+# SMTP config (env-driven)
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER") or os.getenv("SMTP_USERNAME") or os.getenv("SMTP_USER_ALEX") or os.getenv("SMTP_USER_MAIN")
 SMTP_PASS = os.getenv("SMTP_PASS") or os.getenv("SMTP_APP") or os.getenv("GMAIL_APP_PASSWORD_ALEX") or os.getenv("SMTP_PASSWORD")
 FROM_ADDR = os.getenv("SMTP_FROM") or SMTP_USER
 
-DAILY_CAP = int(os.getenv("SEND_DAILY_CAP","50"))
-LIVE = os.getenv('SEND_LIVE','1') == '1'try:
-    if 'dry_run' in kwargs:
-        LIVE = not bool(kwargs.get('dry_run'))
-except Exception:
-    pass   # default to live since you’re clearly sending
+DAILY_CAP = int(os.getenv("SEND_DAILY_CAP", "50"))
+LIVE_DEFAULT = os.getenv("SEND_LIVE", "1") == "1"   # default "live"; can be overridden per-run inside send_queue()
 
 def within_window():
-    win = os.getenv("SEND_WINDOW","00:00-23:59")
-    s,e = [tuple(map(int,x.split(":"))) for x in win.split("-")]
+    win = os.getenv("SEND_WINDOW", "00:00-23:59")
+    s, e = [tuple(map(int, x.split(":"))) for x in win.split("-")]
     now = datetime.now().time()
     return dtime(*s) <= now <= dtime(*e)
 
@@ -34,7 +31,7 @@ def _smtp():
     except smtplib.SMTPException:
         pass
     if SMTP_USER and SMTP_PASS:
-        s.login(SMTP_USER, SMTP_PASS.replace(" ",""))
+        s.login(SMTP_USER, SMTP_PASS.replace(" ", ""))
     return s
 
 def _send_raw(to_email: str, subject: str, body_text: str, body_html: str | None = None):
@@ -50,14 +47,16 @@ def _send_raw(to_email: str, subject: str, body_text: str, body_html: str | None
 
 def send_queue(batch_size=25, allow_weekend=True, **kwargs):
     logger = get_run_logger()
-    live = os.getenv('SEND_LIVE','1') == '1'
-    if isinstance(kwargs, dict) and 'dry_run' in kwargs:
-        try:
+
+    # honor dry_run param if Prefect passes it
+    live = LIVE_DEFAULT
+    try:
+        if 'dry_run' in kwargs:
             live = not bool(kwargs.get('dry_run'))
-        except Exception:
-            pass
-    logger.info(f'RUN_CONFIG live={live} kwargs={list(kwargs.keys())}')
-if not allow_weekend and datetime.utcnow().weekday()>=5:
+    except Exception:
+        pass
+
+    if not allow_weekend and datetime.utcnow().weekday() >= 5:
         logger.info("Outside weekday window; exiting.")
         return 0
     if not within_window():
@@ -78,30 +77,33 @@ if not allow_weekend and datetime.utcnow().weekday()>=5:
     for r in rows:
         if sent_today >= DAILY_CAP:
             break
-        subj = r["subject"] or ""
-        san = (r.get('body') or '')[:160].replace('\n',' ')
-        logger = get_run_logger()
-        logger.info('MAIL_PREVIEW id=%s to=%s subj=%r body=%r', r['send_id'], r['email'], (subj or '')[:72], san)
-        body = r["body"] or ""
-        to   = r["email"]
 
-        san = (body or '')[:160]
-        san = san.replace('\n',' ')
+        subj = (r["subject"] or "").strip()
+        body = (r["body"] or "")
+        to   = (r["email"] or "").strip()
+
+        # safe preview (no f-strings with escapes)
+        logger.info("MAIL_PREVIEW id=%s to=%s subj=%r body=%r",
+                    r["send_id"], to, (subj or "")[:72], (body or "")[:160].replace("\n", " "))
+
         try:
             if live:
                 _send_raw(to, subj, body)
                 mid = "smtp"
             else:
                 mid = "dry-run"
+
             with ENG.begin() as cx:
                 cx.execute(text("""
                   update email_sends
                      set status='sent', provider_message_id=:mid, sent_at=now()
                    where id=:id
                 """), {"mid": mid, "id": r["send_id"]})
+
             sent_today += 1
             time.sleep(1.2)
-            logger.info(f"Sent #{r['send_id']} to {to}")
+            logger.info("Sent #%s to %s", r["send_id"], to)
+
         except Exception as e:
             with ENG.begin() as cx:
                 cx.execute(text("""
@@ -109,6 +111,6 @@ if not allow_weekend and datetime.utcnow().weekday()>=5:
                      set status='failed', error=:err
                    where id=:id
                 """), {"err": str(e)[:300], "id": r["send_id"]})
-            logger.error(f"FAILED #{r['send_id']} to {to} → {e}")
+            logger.error("FAILED #%s to %s -> %s", r["send_id"], to, e)
 
     return sent_today
