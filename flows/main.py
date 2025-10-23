@@ -1,55 +1,42 @@
-from __future__ import annotations
-import os, smtplib, html as _html
-from email.message import EmailMessage
-from email.utils import make_msgid, formatdate
+import os, smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
-def _to_html(md: str) -> str:
-    if not md: 
-        return ""
-    safe = _html.escape(md).replace("\r\n","\n").replace("\r","\n")
-    parts = []
-    for chunk in safe.split("\n\n"):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        parts.append("<p>" + chunk.replace("\n", "<br>") + "</p>")
-    return "".join(parts) or ("<p>" + safe + "</p>")
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS") or os.getenv("SMTP_APP")  # support either
+FROM_ADDR = os.getenv("SMTP_FROM", SMTP_USER or "no-reply@klixads.org")
 
-def send_email(to_addr: str, subject: str, body_text: str, body_html: str | None = None) -> str:
-    """
-    Send exactly the provided body (no legacy template / signature).
-    """
-    host = os.getenv("SMTP_HOST", "smtp.gmail.com")
-    port = int(os.getenv("SMTP_PORT", "587"))
-    username = os.getenv("SMTP_USERNAME") or os.getenv("SMTP_USER")
-    password = os.getenv("SMTP_PASSWORD") or os.getenv("SMTP_APP")
-
-    from_addr  = os.getenv("SMTP_FROM", username or "alex@klixads.org")
-    from_name  = os.getenv("SMTP_FROM_NAME", "Klix")
-    from_header = f"{from_name} <{from_addr}>" if ("<" not in from_addr and from_name) else from_addr
-
-    msg = EmailMessage()
-    msg["From"] = from_header
-    msg["To"] = to_addr
-    msg["Subject"] = subject
-    msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid(domain=os.getenv("SMTP_MSGID_DOMAIN","klixads.org"))
-
-    bt = body_text or ""
-    bh = body_html if body_html is not None else _to_html(bt)
-
-    msg.set_content(bt)           # text/plain
-    if bh:
-        msg.add_alternative(bh, subtype="html")
-
-    with smtplib.SMTP(host, port, timeout=30) as s:
+def _smtp():
+    s = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
+    s.ehlo()
+    try:
+        s.starttls()
         s.ehlo()
-        try:
-            s.starttls()
-        except smtplib.SMTPException:
-            pass
-        if username and password:
-            s.login(username, password)
-        s.send_message(msg)
+    except smtplib.SMTPException:
+        pass
+    if SMTP_USER and SMTP_PASS:
+        s.login(SMTP_USER, SMTP_PASS)
+    return s
 
-    return msg["Message-ID"].strip("<>")
+def send_email(to_email: str, subject: str, body_text: str, body_html: str | None = None) -> str | None:
+    """
+    Send exactly the subject/body provided (no templates).
+    Returns a provider message id if available (None for raw SMTP).
+    """
+    if body_html:
+        msg = MIMEMultipart("alternative")
+        msg.attach(MIMEText(body_text or "", "plain", "utf-8"))
+        msg.attach(MIMEText(body_html, "html", "utf-8"))
+    else:
+        msg = MIMEText(body_text or "", "plain", "utf-8")
+
+    msg["Subject"] = subject or ""
+    msg["To"] = to_email
+    msg["From"] = FROM_ADDR
+
+    with _smtp() as s:
+        s.sendmail(FROM_ADDR, [to_email], msg.as_string())
+    # raw SMTP doesn't give us a message id; Prefect caller handles None
+    return None
