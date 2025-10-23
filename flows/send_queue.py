@@ -1,10 +1,17 @@
 from __future__ import annotations
+import re
 import os, time, random, ssl, smtplib, email.utils
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.header import Header
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
+
+def _clean_addr(a: str) -> str:
+    a = (a or '').strip()
+    a = re.sub(r'^mailto:', '', a, flags=re.I)
+    a = a.split('?', 1)[0]
+    return a.lower()
 
 from prefect import flow, get_run_logger
 from sqlalchemy import create_engine, text
@@ -77,7 +84,7 @@ def _mark_failed(conn, send_id: int, reason: str):
     conn.execute(text("""
         update email_sends
            set status='failed',
-               failure_reason=:r
+               error=:r
          where id=:id
     """), {"r": (reason or "")[:500], "id": send_id})
 
@@ -118,6 +125,9 @@ def _send_via_smtp(host: str, port: int, username: str, app_password: str,
         server.ehlo()
         server.starttls(context=ctx); server.ehlo()
         server.login(username, app_password.replace(" ", ""))
+        to = _clean_addr(to)
+        if not re.match(r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$', to):
+            raise ValueError(f'invalid recipient: {to}')
         server.sendmail(username, [to], raw)
     return msg["Message-ID"]
 
