@@ -71,7 +71,9 @@ def send_queue(batch_size=25, allow_weekend=True):
         body = r["body"] or ""
         to   = r["email"]
 
-        logger.info(f"MAIL_PREVIEW id={r['send_id']} to={to} subj={subj[:72]!r} body={body[:160].replace('\\n',' ')!r}")
+        san = (body or '')[:160]
+        san = san.replace('\n',' ')
+        logger.info(f"MAIL_PREVIEW id={r['send_id']} to={to} subj={(subj or '')[:72]!r} body={san!r}")
 
         try:
             if LIVE:
