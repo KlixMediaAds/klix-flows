@@ -14,7 +14,12 @@ SMTP_PASS = os.getenv("SMTP_PASS") or os.getenv("SMTP_APP") or os.getenv("GMAIL_
 FROM_ADDR = os.getenv("SMTP_FROM") or SMTP_USER
 
 DAILY_CAP = int(os.getenv("SEND_DAILY_CAP","50"))
-LIVE = os.getenv("SEND_LIVE","1") == "1"   # default to live since you’re clearly sending
+LIVE = os.getenv("SEND_LIVE","1") == "1"
+try:
+    if 'dry_run' in kwargs:
+        LIVE = not bool(kwargs.get('dry_run'))
+except Exception:
+    pass   # default to live since you’re clearly sending
 
 def within_window():
     win = os.getenv("SEND_WINDOW","00:00-23:59")
