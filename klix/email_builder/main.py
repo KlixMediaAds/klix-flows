@@ -10,16 +10,23 @@ def _domain(email: str) -> str:
     return e.split("@",1)[1].lower() if "@" in e else ""
 
 def _to_html(md: str) -> str:
-    if not md: return ""
+    """Very small MD→HTML: paragraphs + line breaks (no f-string backslashes)."""
+    if not md:
+        return ""
     safe = html.escape(md).replace("\r\n","\n").replace("\r","\n")
-    parts = [f"<p>{p.replace('\n','<br>')}</p>" for p in safe.split("\n\n") if p.strip()]
-    return "".join(parts) or f"<p>{safe}</p>"
+    parts = []
+    for chunk in safe.split("\n\n"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts.append("<p>" + chunk.replace("\n", "<br>") + "</p>")
+    return "".join(parts) or ("<p>" + safe + "</p>")
 
 def build_email_for_lead(lead: Dict[str, Any]) -> Tuple[str, str, str, str]:
     """
     Returns (subject, body_text, body_html, send_type) using your AI prompt-based generator.
     """
-    email = (lead.get("email") or "").strip()
+    email   = (lead.get("email") or "").strip()
     company = (lead.get("company") or lead.get("name") or "your brand").strip()
     website = (lead.get("website") or "").strip()
     city    = (lead.get("city") or "").strip()
