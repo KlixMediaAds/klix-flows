@@ -1,64 +1,101 @@
 # flows/send_queue.py
 from __future__ import annotations
 
-import os, time, re
+import os, time, re, smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.header import Header
+from email.utils import formataddr
 from datetime import datetime, time as dtime
 from sqlalchemy import create_engine, text
 from prefect import flow, get_run_logger
 
-# your existing sender
-from .main import send_email
-
 ENG = create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True, future=True)
+
+# SMTP config (env-driven)
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER") or os.getenv("SMTP_USERNAME") \
+            or os.getenv("SMTP_USER_ALEX") or os.getenv("SMTP_USER_MAIN")
+SMTP_PASS = os.getenv("SMTP_PASS") or os.getenv("SMTP_APP") \
+            or os.getenv("GMAIL_APP_PASSWORD_ALEX") or os.getenv("SMTP_PASSWORD")
+FROM_ADDR = os.getenv("SMTP_FROM") or SMTP_USER or "noreply@klix.local"
+
 DAILY_CAP = int(os.getenv("SEND_DAILY_CAP", "50"))
 
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
 def _within_window() -> bool:
-    # server in UTC; e.g. 13:00-21:00 for 9–5 Toronto
-    win = os.getenv("SEND_WINDOW", "13:00-21:00")
+    # default wide-open if not set; you can tighten in env
+    win = os.getenv("SEND_WINDOW", "00:00-23:59")
     s, e = [tuple(map(int, x.split(":"))) for x in win.split("-")]
     now = datetime.now().time()
     return dtime(*s) <= now <= dtime(*e)
 
-def _clean_email(addr: str) -> str:
-    if not addr:
-        return addr
-    a = addr.strip()
-    # strip mailto: and any query string like ?subject=...
+def _clean_email(addr: str | None) -> str:
+    a = (addr or "").strip()
+    if not a:
+        return ""
     if a.lower().startswith("mailto:"):
         a = a[7:]
     a = a.split("?", 1)[0]
     return a.strip().lower()
 
-def _send_exact(to_email: str, subject: str, body: str) -> str:
-    """
-    Call your send_email while strongly preferring 'raw' rendering if available.
-    Returns provider message id (or 'unknown-id').
-    """
+def _smtp():
+    s = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
+    s.ehlo()
     try:
-        # if your sender supports this, it will bypass any templating
-        return send_email(to_email, subject, body, force_raw=True) or "unknown-id"
-    except TypeError:
-        try:
-            return send_email(to_email, subject, body, render_mode="raw") or "unknown-id"
-        except TypeError:
-            return send_email(to_email, subject, body) or "unknown-id"
+        s.starttls()
+        s.ehlo()
+    except smtplib.SMTPException:
+        # some servers might already be TLS; ignore
+        pass
+    if (SMTP_USER or "") and (SMTP_PASS or ""):
+        s.login(str(SMTP_USER).strip(), str(SMTP_PASS).strip())
+    return s
+
+def _send_raw(to_email: str, subject: str, body_text: str, body_html: str | None = None) -> str:
+    # Always work with strings; no .strip() on None
+    subj = (subject or "").strip()
+    from_addr = (FROM_ADDR or "").strip() or "noreply@klix.local"
+    to_addr = (to_email or "").strip()
+
+    if not EMAIL_RE.match(to_addr):
+        raise ValueError(f"Invalid recipient address: {to_addr!r}")
+
+    # Text/HTML MIME
+    if body_html:
+        msg = MIMEMultipart("alternative")
+        msg.attach(MIMEText(body_text or "", "plain", "utf-8"))
+        msg.attach(MIMEText(body_html or "", "html", "utf-8"))
+    else:
+        msg = MIMEText(body_text or "", "plain", "utf-8")
+
+    msg["Subject"] = Header(subj, "utf-8")
+    # If you want a friendly display name, set SMTP_FROM_NAME env
+    from_name = (os.getenv("SMTP_FROM_NAME") or "").strip()
+    msg["From"] = formataddr((from_name, from_addr)) if from_name else from_addr
+    msg["To"] = to_addr
+
+    with _smtp() as s:
+        s.sendmail(from_addr, [to_addr], msg.as_string())
+
+    # If you wire a real provider later, return their message-id here
+    return "smtp-ok"
 
 @flow(name="send-queue")
-def send_queue(batch_size: int = 25, allow_weekend: bool = False, **kwargs):
+def send_queue(batch_size: int = 25, allow_weekend: bool = True, **kwargs) -> int:
     """
-    Simple queue sender:
-      - pulls next queued rows
-      - sends using exact DB subject/body
-      - updates status to sent/failed
-    Accepts **kwargs so older deployments that pass extra params won't crash.
-    Set dry_run via params or SEND_LIVE env.
+    Pull 'queued' rows from email_sends, send via SMTP, and mark sent/failed.
+    Live only if SEND_LIVE=1 AND not dry_run param.
     """
     logger = get_run_logger()
 
-    # live iff SEND_LIVE=1 AND not dry_run param
     live_env = (os.getenv("SEND_LIVE", "0") == "1")
-    live = live_env and not bool(kwargs.get("dry_run", False))
+    dry_run = bool(kwargs.get("dry_run", False))
+    live = (live_env and not dry_run)
 
+    # Weekend / window guards
     if not allow_weekend and datetime.utcnow().weekday() >= 5:
         logger.info("Outside weekday window; exiting.")
         return 0
@@ -66,53 +103,64 @@ def send_queue(batch_size: int = 25, allow_weekend: bool = False, **kwargs):
         logger.info("Outside time window; exiting.")
         return 0
 
-    sent_today = 0
+    # Pull rows
     with ENG.begin() as cx:
         rows = cx.execute(text("""
-            select s.id as send_id, s.lead_id, s.subject, s.body, l.email
+            select s.id as send_id, s.lead_id, s.subject, s.body, s.body_html, l.email
               from email_sends s
               join leads l on l.id = s.lead_id
-             where s.status='queued'
+             where s.status = 'queued'
              order by s.id asc
              limit :lim
         """), {"lim": batch_size}).mappings().all()
 
+    if not rows:
+        logger.info("No queued rows.")
+        return 0
+
+    sent_count = 0
+
     for r in rows:
-        if sent_today >= DAILY_CAP:
+        if sent_count >= DAILY_CAP:
             break
 
-        to_raw = r["email"]
-        to = _clean_email(to_raw)
-        subj = r["subject"] or ""
-        body = r["body"] or ""
+        to_raw  = _clean_email(r.get("email"))
+        subj    = (r.get("subject") or "")
+        body    = (r.get("body") or "")
+        body_ht = r.get("body_html")  # may be None
 
-        # Safe preview (no f-strings with backslashes)
-        preview = (body or "")[:160].replace("\n", " ")
-        logger.info(
-            "MAIL_PREVIEW id=%s to=%s subj=%r body=%r",
-            r["send_id"], to, (subj or "")[:72], preview
-        )
+        preview = (body or body_ht or "")[:160].replace("\n", " ")
+        logger.info("MAIL_PREVIEW id=%s to=%s subj=%r body=%r",
+                    r["send_id"], to_raw, (subj or "")[:72], preview)
 
         try:
-            mid = "dry-run"
-            if live:
-                mid = _send_exact(to, subj, body)
+            if not live:
+                mid = "dry-run"
+            else:
+                mid = _send_raw(to_raw, subj, body, body_ht)
+
             with ENG.begin() as cx:
                 cx.execute(text("""
                     update email_sends
-                       set status='sent', provider_message_id=:mid, sent_at=now()
+                       set status='sent',
+                           provider_message_id=:mid,
+                           sent_at=now()
                      where id=:id
                 """), {"mid": mid, "id": r["send_id"]})
-            sent_today += 1
-            time.sleep(1.2)  # light throttle
-            logger.info("Sent #%s to %s", r["send_id"], to)
+
+            sent_count += 1
+            time.sleep(1.0)  # small throttle
+            logger.info("Sent #%s to %s", r["send_id"], to_raw)
+
         except Exception as e:
+            err = (str(e) or "")[:300]
             with ENG.begin() as cx:
                 cx.execute(text("""
                     update email_sends
-                       set status='failed', error=:err
+                       set status='failed',
+                           error=:err
                      where id=:id
-                """), {"err": str(e)[:300], "id": r["send_id"]})
-            logger.error("FAILED #%s to %s -> %s", r["send_id"], to, e)
+                """), {"err": err, "id": r["send_id"]})
+            logger.error("FAILED #%s to %s -> %s", r["send_id"], to_raw, err)
 
-    return sent_today
+    return sent_count
