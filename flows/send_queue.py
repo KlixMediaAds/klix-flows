@@ -8,12 +8,14 @@ import logging
 import datetime as dt
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+
+import psycopg2
 from sqlalchemy import create_engine, text
 from prefect import get_run_logger
 
 # ---------- CONFIG & GLOBALS -------------------------------------------------
 
-# DB (pool_pre_ping avoids stale connections on short runs)
+# DB (SQLAlchemy ok with postgresql+psycopg); psycopg2 calls will normalize.
 ENG = create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True, future=True)
 
 # SMTP config (env-driven)
@@ -48,6 +50,19 @@ LIVE_DEFAULT = os.getenv("SEND_LIVE", "1") == "1"
 # Exactly 1 email per run (blueprint)
 BATCH_HARD_LIMIT = 1
 
+# ---------- INTERNAL DB NORMALIZATION (for psycopg2 use) ---------------------
+
+def _normalize_db(url: str) -> str:
+    if not url:
+        return url
+    # Convert SQLAlchemy-style to psycopg2-friendly
+    if url.startswith("postgresql+psycopg://"):
+        url = "postgresql://" + url.split("postgresql+psycopg://", 1)[1]
+    # Ensure SSL
+    if "sslmode=" not in url:
+        url += ("&" if "?" in url else "?") + "sslmode=require"
+    return url
+
 # ---------- HELPERS ----------------------------------------------------------
 
 def _now_local_or_utc():
@@ -55,8 +70,7 @@ def _now_local_or_utc():
 
 def _parse_window(window: str):
     """
-    "13:00-21:00" -> (start_dt_today, end_dt_today) in the chosen time base
-    (UTC if SEND_WINDOW_TZ=utc else local time).
+    "13:00-21:00" -> (start_dt_today, end_dt_today) in the chosen time base.
     """
     today = _now_local_or_utc().date()
     start_s, end_s = window.split("-")
@@ -128,7 +142,6 @@ def _warmup_cap(default_cap: int) -> int:
         if not bands:
             return default_cap
         if week >= len(bands):
-            # after plan ends, use last band's high as steady state
             return bands[-1][1]
         lo, hi = bands[week]
         seed = int(today.strftime("%Y%m%d"))
@@ -137,6 +150,42 @@ def _warmup_cap(default_cap: int) -> int:
     except Exception:
         return default_cap
 
+# ---------- DOMAIN THROTTLE (Block 4) ----------------------------------------
+
+def _ensure_from_domain_column():
+    """Add from_domain column if it's not there (one-time)."""
+    try:
+        with ENG.begin() as c:
+            c.execute(text("ALTER TABLE email_sends ADD COLUMN IF NOT EXISTS from_domain text"))
+    except Exception:
+        # non-fatal
+        pass
+
+def _sender_domain() -> str:
+    sender = (FROM_ADDR or SMTP_USER or "").strip()
+    if "@" in sender:
+        return sender.split("@")[-1].lower()
+    return "unknown"
+
+def _domain_send_ok(domain: str) -> bool:
+    """Check email_health.daily_cap by sender domain vs today's sent count for that domain."""
+    db = _normalize_db(os.environ.get("DATABASE_URL", ""))
+    today = dt.datetime.utcnow().date()
+    with psycopg2.connect(db) as c, c.cursor() as cur:
+        # default daily cap 40 if row missing
+        cur.execute("SELECT COALESCE(daily_cap,40) FROM email_health WHERE domain=%s", (domain,))
+        row = cur.fetchone()
+        cap = row[0] if row else 40
+        # count today's sends from this sender domain
+        cur.execute("""
+            SELECT COUNT(*) FROM email_sends
+            WHERE COALESCE(from_domain,'') = %s
+              AND status='sent'
+              AND sent_at::date=%s
+        """, (domain, today))
+        sent_today = cur.fetchone()[0]
+        return sent_today < cap
+
 # ---------- FLOW ENTRYPOINT --------------------------------------------------
 
 def send_queue(batch_size: int = 1, allow_weekend: bool = True, **kwargs):
@@ -144,10 +193,15 @@ def send_queue(batch_size: int = 1, allow_weekend: bool = True, **kwargs):
     Sends exactly one email per run (hard limit), with:
       - JITTER at start (SEND_JITTER_MAX seconds)
       - DAILY CAP derived from warm-up (WARMUP_WEEKLY/WARMUP_START) or SEND_DAILY_CAP
-      - PROBABILISTIC SPACING to spread sends across remaining slots in the window
+      - PER-DOMAIN CAP via email_health (domain caps)
+      - PROBABILISTIC SPACING across remaining slots
     """
     logger = get_run_logger()
     log = logging.getLogger(__name__)
+
+    # Make sure schema supports domain logging
+    _ensure_from_domain_column()
+    sender_domain = _sender_domain()
 
     # Honor Prefect's dry_run param if provided
     live = LIVE_DEFAULT
@@ -167,23 +221,32 @@ def send_queue(batch_size: int = 1, allow_weekend: bool = True, **kwargs):
         logger.info("Outside time window (%s, tz=%s); exiting.", SEND_WINDOW, SEND_WINDOW_TZ)
         return 0
 
+    # Domain health guard (skip entire run if sender domain is capped)
+    try:
+        if not _domain_send_ok(sender_domain):
+            logger.info("DOMAIN-CAP: %s is at cap; skipping this slot.", sender_domain)
+            return 0
+    except Exception as e:
+        logger.warning("DOMAIN-CAP check failed (%s); proceeding with global cap only.", e)
+
     # Jitter to break patterned start times
     if SEND_JITTER_MAX > 0:
         d = random.randint(0, SEND_JITTER_MAX)
         logger.info("JITTER: sleeping %ss before evaluate/send", d)
         time.sleep(d)
 
-    # Compute today's cap (warm-up → cap; else fallback to SEND_DAILY_CAP_DEFAULT)
+    # Global daily cap via warm-up plan
     cap_today = _warmup_cap(SEND_DAILY_CAP_DEFAULT)
-    sent_today = _today_sent_count()
-    if sent_today >= cap_today:
-        logger.info("DAILY-CAP: sent_today=%s >= cap_today=%s; skipping.", sent_today, cap_today)
+    sent_today_global = _today_sent_count()
+    if sent_today_global >= cap_today:
+        logger.info("DAILY-CAP (global): sent_today=%s >= cap_today=%s; skipping.",
+                    sent_today_global, cap_today)
         return 0
 
     # Probabilistic spacing across remaining slots (assumes cron every SLOT_SECONDS)
     sec_left = _seconds_left_in_window(SEND_WINDOW)
     slots_left = max(1, math.ceil(sec_left / max(1, SLOT_SECONDS)))
-    remaining_allowed = max(0, cap_today - sent_today)
+    remaining_allowed = max(0, cap_today - sent_today_global)
     p = min(1.0, remaining_allowed / slots_left)
     if p < 1.0:
         r = random.random()
@@ -215,8 +278,17 @@ def send_queue(batch_size: int = 1, allow_weekend: bool = True, **kwargs):
     sent_count = 0
 
     for r in rows:
-        if sent_today + sent_count >= cap_today:
-            logger.info("DAILY-CAP mid-run: reached cap %s.", cap_today)
+        # Re-check domain cap just before send (race safety if multiple workers later)
+        try:
+            if not _domain_send_ok(sender_domain):
+                logger.info("DOMAIN-CAP mid-run: %s capped; aborting remaining sends.", sender_domain)
+                break
+        except Exception as e:
+            logger.warning("DOMAIN-CAP mid-run check failed (%s); continuing.", e)
+
+        # Also re-check global cap mid-run
+        if sent_today_global + sent_count >= cap_today:
+            logger.info("DAILY-CAP mid-run: reached global cap %s.", cap_today)
             break
 
         subj = (r["subject"] or "").strip()
@@ -239,9 +311,12 @@ def send_queue(batch_size: int = 1, allow_weekend: bool = True, **kwargs):
             with ENG.begin() as cx:
                 cx.execute(text("""
                     update email_sends
-                       set status='sent', provider_message_id=:mid, sent_at=now()
+                       set status='sent',
+                           provider_message_id=:mid,
+                           sent_at=now(),
+                           from_domain=:fd
                      where id=:id
-                """), {"mid": provider_id, "id": r["send_id"]})
+                """), {"mid": provider_id, "fd": sender_domain, "id": r["send_id"]})
 
             sent_count += 1
             # small think-time; jitter already handled at start
@@ -252,9 +327,9 @@ def send_queue(batch_size: int = 1, allow_weekend: bool = True, **kwargs):
             with ENG.begin() as cx:
                 cx.execute(text("""
                     update email_sends
-                       set status='failed', error=:err
+                       set status='failed', error=:err, from_domain=:fd
                      where id=:id
-                """), {"err": str(e)[:300], "id": r["send_id"]})
+                """), {"err": str(e)[:300], "fd": sender_domain, "id": r["send_id"]})
             logger.error("FAILED #%s to %s -> %s", r["send_id"], to, e)
 
     return sent_count
