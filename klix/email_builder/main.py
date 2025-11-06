@@ -11,7 +11,7 @@ FRIENDLY_DOMAINS = {"gmail.com", "klixads.org"}
 
 
 def _domain(email: str) -> str:
-    email = email or ""
+    email = (email or "").strip()
     return email.split("@", 1)[1].lower() if "@" in email else ""
 
 
@@ -140,8 +140,8 @@ def build_email_for_lead(
     # 1) Prefer an already-queued row (so sender uses it instead of regenerating)
     queued = _oldest_queued_for_lead(lead_id)
     if queued and queued.get("subject") and queued.get("body"):
-        subj = queued["subject"]
-        body_text = queued["body"]
+        subj = queued["subject"].strip()
+        body_text = queued["body"].strip()
         body_html = _to_html(body_text)
         send_type = "friendly" if _domain(email) in FRIENDLY_DOMAINS else "cold"
         return subj, body_text, body_html, send_type, None
@@ -172,8 +172,8 @@ def build_email_for_lead(
         pr.SYSTEM_TEXT = system_text
 
     draft = pr.draft_email(biz, angle_id=angle_id, model_name=model_name)
-    subj = draft.get("subject") or "Tiny video thought"
-    body_text = draft.get("body_md") or ""
+    subj = (draft.get("subject") or "").strip() or "Tiny video thought"
+    body_text = (draft.get("body_md") or "").strip()
     body_html = _to_html(body_text)
     send_type = "friendly" if _domain(email) in FRIENDLY_DOMAINS else "cold"
 
