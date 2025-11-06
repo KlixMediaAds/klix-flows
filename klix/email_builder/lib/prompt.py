@@ -50,7 +50,7 @@ _DEFAULT_CFG = {
             "Mind if I send two mini concepts?", "Okay if I share a tiny test?",
             "Cool if I send a micro-example?", "Okay if I send a quick mock?"
         ],
-        "micro_commit": [
+    "micro_commit": [
             "Should I send two tiny options?", "Want me to sketch two routes?",
             "Want two small directions to compare?"
         ]
