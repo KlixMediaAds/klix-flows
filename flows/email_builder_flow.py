@@ -88,21 +88,22 @@ def email_builder(limit: int = 60, friendlies_domains: List[str] | None = None):
                 "lead_id": lead["id"],
                 "send_type": send_type,
                 "status": "queued",
-                "subject": (subj or "").strip(),
+                "subject": subj or "",
             }
 
-            # put bodies in the right columns
+            # Put bodies in the right columns
             if use_text:
                 fields.append("body_text")
-                params["body_text"] = (body_text or "").strip()
+                params["body_text"] = body_text or ""
             elif use_body:
                 fields.append("body")
-                params["body"] = (body_text or "").strip()
-            if use_html and (body_html or "").strip():
-                fields.append("body_html")
-                params["body_html"] = body_html.strip()
+                params["body"] = body_text or ""
 
-            # store prompt_profile_id when available
+            if use_html and (body_html or ""):
+                fields.append("body_html")
+                params["body_html"] = body_html or ""
+
+            # NEW: store prompt_profile_id when provided
             if has_prompt_profile_id and prompt_profile_id:
                 fields.append("prompt_profile_id")
                 params["prompt_profile_id"] = prompt_profile_id
