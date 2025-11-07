@@ -422,8 +422,8 @@ def send_queue(batch_size: int = 1, allow_weekend: bool = True, **kwargs):
     """
     Sends up to one email per run (hard limit), with:
       - JITTER at start
-      - DAILY CAP via warm-up (WARMUP_WEEKLY/WARMUP_START) or SEND_DAILY_CAP
-      - PER-DOMAIN CAP via email_health (domain caps)
+      - GLOBAL CAP via warm-up ramp (WARMUP_WEEKLY/WARMUP_START) or SEND_DAILY_CAP
+      - PER-DOMAIN / PER-INBOX CAPS via email_health + inboxes + warmup_analytics
       - PROBABILISTIC SPACING across remaining slots
       - Delivered telemetry into provider_events
       - Discord alerts on cap hits (if configured)
@@ -432,13 +432,12 @@ def send_queue(batch_size: int = 1, allow_weekend: bool = True, **kwargs):
     log = logging.getLogger(__name__)
 
     _ensure_from_domain_column()
-    sender_domain = _sender_domain()
 
     # Respect Prefect dry_run param if provided
     live = LIVE_DEFAULT
     try:
-        if 'dry_run' in kwargs:
-            live = not bool(kwargs.get('dry_run'))
+        if "dry_run" in kwargs:
+            live = not bool(kwargs.get("dry_run"))
     except Exception:
         pass
 
@@ -452,61 +451,74 @@ def send_queue(batch_size: int = 1, allow_weekend: bool = True, **kwargs):
         logger.info("Outside time window (%s, tz=%s); exiting.", SEND_WINDOW, SEND_WINDOW_TZ)
         return 0
 
-    # Domain cap guard
+    # Load inbox + warmup state
     try:
-        if not _domain_send_ok(sender_domain):
-            msg = f"⛔ Domain cap hit for {sender_domain}. Skipping this run."
-            logger.info("DOMAIN-CAP: %s is at cap; skipping this slot.", sender_domain)
-            try: post_discord(msg)
-            except Exception: pass
-            return 0
+        inboxes = _load_inbox_state()
     except Exception as e:
-        logger.warning("DOMAIN-CAP check failed (%s); proceeding with global cap only.", e)
+        logger.error("Failed to load inbox state: %s", e)
+        return 0
 
-    # Jitter
-    if SEND_JITTER_MAX > 0:
-        d = random.randint(0, SEND_JITTER_MAX)
-        logger.info("JITTER: sleeping %ss before evaluate/send", d)
-        time.sleep(d)
+    if not inboxes:
+        logger.info("No active inboxes configured; skipping send_queue.")
+        return 0
 
-    # Global daily cap
+    # Global cap via warm-up ramp (interpreted as *total* volume: cold + warmup)
     cap_today = _warmup_cap(SEND_DAILY_CAP_DEFAULT)
-    sent_today_global = _today_sent_count()
-    if sent_today_global >= cap_today:
-        msg = f"⛔ Global cap reached: sent_today={sent_today_global} cap={cap_today}. Skipping."
-        logger.info("DAILY-CAP (global): sent_today=%s >= cap_today=%s; skipping.",
-                    sent_today_global, cap_today)
-        try: post_discord(msg)
-        except Exception: pass
+    cold_sent_total = sum(ib["cold_sent_today"] for ib in inboxes)
+    warmup_total = sum(ib["warmup_sent_today"] for ib in inboxes)
+    total_load_today = cold_sent_total + warmup_total
+
+    if total_load_today >= cap_today:
+        msg = (
+            f"⛔ Global cap reached: total_load_today={total_load_today} "
+            f"(cold={cold_sent_total}, warmup={warmup_total}) cap={cap_today}. Skipping."
+        )
+        logger.info(msg)
+        try:
+            post_discord(msg)
+        except Exception:
+            pass
         return 0
 
     # Probabilistic spacing across remaining slots
     sec_left = _seconds_left_in_window(SEND_WINDOW)
     slots_left = max(1, math.ceil(sec_left / max(1, SLOT_SECONDS)))
-    remaining_allowed = max(0, cap_today - sent_today_global)
+    remaining_allowed = max(0, cap_today - total_load_today)
     p = min(1.0, remaining_allowed / slots_left)
     if p < 1.0:
         r = random.random()
         if r > p:
             logger.info(
                 "SPACING: skipping this slot (p=%.2f, r=%.2f, remaining=%s, slots_left=%s)",
-                p, r, remaining_allowed, slots_left
+                p,
+                r,
+                remaining_allowed,
+                slots_left,
             )
             return 0
 
     # Hard limit to 1 email/run
     effective_batch = max(1, min(int(batch_size or 1), BATCH_HARD_LIMIT))
 
-    # Fetch one queued row deterministically (oldest first)
+    # Fetch queued rows (oldest first)
     with ENG.begin() as cx:
-        rows = cx.execute(text("""
-            select s.id as send_id, s.lead_id, s.subject, s.body, l.email
-              from email_sends s
-              join leads l on l.id = s.lead_id
-             where s.status='queued'
-             order by s.id asc
-             limit :lim
-        """), {"lim": effective_batch}).mappings().all()
+        rows = (
+            cx.execute(
+                text(
+                    """
+                    SELECT s.id AS send_id, s.lead_id, s.subject, s.body, l.email
+                    FROM email_sends s
+                    JOIN leads l ON l.id = s.lead_id
+                    WHERE s.status='queued'
+                    ORDER BY s.id ASC
+                    LIMIT :lim
+                    """
+                ),
+                {"lim": effective_batch},
+            )
+            .mappings()
+            .all()
+        )
 
     if not rows:
         logger.info("No queued emails found.")
@@ -515,52 +527,75 @@ def send_queue(batch_size: int = 1, allow_weekend: bool = True, **kwargs):
     sent_count = 0
 
     for r in rows:
-        # Re-check domain cap mid-run
-        try:
-            if not _domain_send_ok(sender_domain):
-                logger.info("DOMAIN-CAP mid-run: %s capped; aborting remaining sends.", sender_domain)
-                try: post_discord(f"⛔ Domain cap hit mid-run for {sender_domain}. Aborting.")
-                except Exception: pass
-                break
-        except Exception as e:
-            logger.warning("DOMAIN-CAP mid-run check failed (%s); continuing.", e)
-
-        # Re-check global cap mid-run
-        if sent_today_global + sent_count >= cap_today:
+        # Global cap mid-run (total volume: cold + warmup)
+        if total_load_today + sent_count >= cap_today:
             logger.info("DAILY-CAP mid-run: reached global cap %s.", cap_today)
-            try: post_discord(f"⛔ Global cap hit mid-run (cap={cap_today}). Aborting.")
-            except Exception: pass
+            try:
+                post_discord(f"⛔ Global cap hit mid-run (cap={cap_today}). Aborting.")
+            except Exception:
+                pass
             break
+
+        inbox = _choose_inbox_for_send(inboxes)
+        if inbox is None:
+            logger.info("No inbox with remaining cold capacity; stopping sends.")
+            try:
+                post_discord(":no_entry: All inbox caps exhausted for today; stopping send_queue.")
+            except Exception:
+                pass
+            break
+
+        from_email = inbox["email_address"]
+        sender_domain = inbox["domain"]
+
+        if inbox["cold_remaining"] <= 0:
+            logger.info("Inbox %s has no cold_remaining; skipping.", from_email)
+            continue
 
         send_id = int(r["send_id"])
         subj = (r["subject"] or "").strip()
         body = (r["body"] or "")
-        to   = (r["email"] or "").strip()
+        to = (r["email"] or "").strip()
 
         # Build text/html bodies (and add tracking if configured)
         body_text, body_html = _make_bodies_for_send(send_id, body)
 
         logger.info(
-            "MAIL_PREVIEW id=%s to=%s subj=%r body=%r",
-            send_id, to, (subj or "")[:72], (body or "")[:160].replace("\n", " ")
+            "MAIL_PREVIEW id=%s to=%s via=%s subj=%r body=%r",
+            send_id,
+            to,
+            from_email,
+            (subj or "")[:72],
+            (body or "")[:160].replace("\n", " "),
         )
 
         try:
             if live:
-                _send_raw(to, subj, body_text, body_html)
+                _send_raw(to, subj, body_text, body_html, from_email=from_email)
                 provider_id = "smtp"
             else:
                 provider_id = "dry-run"
 
             with ENG.begin() as cx:
-                cx.execute(text("""
-                    update email_sends
-                       set status='sent',
-                           provider_message_id=:mid,
-                           sent_at=now(),
-                           from_domain=:fd
-                     where id=:id
-                """), {"mid": provider_id, "fd": sender_domain, "id": send_id})
+                cx.execute(
+                    text(
+                        """
+                        UPDATE email_sends
+                           SET status='sent',
+                               provider_message_id=:mid,
+                               sent_at=now(),
+                               from_domain=:fd,
+                               inbox_id=:iid
+                         WHERE id=:id
+                        """
+                    ),
+                    {
+                        "mid": provider_id,
+                        "fd": sender_domain,
+                        "iid": inbox["inbox_id"],
+                        "id": send_id,
+                    },
+                )
 
             # provider_events: delivered
             try:
@@ -569,18 +604,37 @@ def send_queue(batch_size: int = 1, allow_weekend: bool = True, **kwargs):
                 pass
 
             sent_count += 1
+            total_load_today += 1
+            inbox["cold_sent_today"] += 1
+            inbox["cold_remaining"] = max(0, inbox["cold_remaining"] - 1)
+
             time.sleep(0.8)
-            logger.info("Sent #%s to %s", send_id, to)
+            logger.info("Sent #%s to %s via %s", send_id, to, from_email)
 
         except Exception as e:
             with ENG.begin() as cx:
-                cx.execute(text("""
-                    update email_sends
-                       set status='failed', error=:err, from_domain=:fd
-                     where id=:id
-                """), {"err": str(e)[:300], "fd": sender_domain, "id": send_id})
-            logger.error("FAILED #%s to %s -> %s", send_id, to, e)
-            try: post_discord(f"❌ Send failed for id={send_id} to={to}: {e}")
-            except Exception: pass
+                cx.execute(
+                    text(
+                        """
+                        UPDATE email_sends
+                           SET status='failed',
+                               error=:err,
+                               from_domain=:fd,
+                               inbox_id=:iid
+                         WHERE id=:id
+                        """
+                    ),
+                    {
+                        "err": str(e)[:300],
+                        "fd": sender_domain,
+                        "iid": inbox["inbox_id"],
+                        "id": send_id,
+                    },
+                )
+            logger.error("FAILED #%s to %s via %s -> %s", send_id, to, from_email, e)
+            try:
+                post_discord(f"❌ Send failed for id={send_id} to={to} via {from_email}: {e}")
+            except Exception:
+                pass
 
     return sent_count
