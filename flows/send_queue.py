@@ -118,18 +118,34 @@ def _smtp():
         s.login(SMTP_USER, (SMTP_PASS or "").replace(" ", ""))
     return s
 
-def _send_raw(to_email: str, subject: str, body_text: str, body_html: Optional[str] = None):
+def _send_raw(
+    to_email: str,
+    subject: str,
+    body_text: str,
+    body_html: Optional[str] = None,
+    from_email: Optional[str] = None,
+):
+    """
+    Low-level SMTP send.
+
+    from_email overrides the header + envelope sender. If not provided, we fall
+    back to FROM_ADDR / SMTP_USER as before.
+    """
     if body_html:
         msg = MIMEMultipart("alternative")
         msg.attach(MIMEText(body_text or "", "plain", "utf-8"))
         msg.attach(MIMEText(body_html, "html", "utf-8"))
     else:
         msg = MIMEText(body_text or "", "plain", "utf-8")
+
+    sender = (from_email or FROM_ADDR or SMTP_USER or "").strip()
+
     msg["Subject"] = subject or ""
     msg["To"] = to_email
-    msg["From"] = FROM_ADDR or SMTP_USER
+    msg["From"] = sender
+
     with _smtp() as s:
-        s.sendmail(msg["From"], [to_email], msg.as_string())
+        s.sendmail(sender, [to_email], msg.as_string())
 
 # ---------- DB HELPERS -------------------------------------------------------
 
@@ -210,6 +226,145 @@ def _log_provider_event(send_id: Optional[int], event_type: str, rcpt: Optional[
             "domain": sender_domain,
             "payload": payload
         })
+
+# ---------- INBOX / WARMUP STATE HELPERS ------------------------------------
+
+
+def _load_inbox_state() -> List[Dict[str, Any]]:
+    """
+    Load all active inboxes and their:
+      - base_cap (per inbox or per domain, falling back to SEND_DAILY_CAP_DEFAULT)
+      - cold_sent_today (from email_sends)
+      - warmup_sent_today (from warmup_analytics->email_date_data)
+      - cold_remaining = base_cap - cold_sent_today - warmup_sent_today
+    """
+    today = dt.datetime.utcnow().date()
+    today_str = today.isoformat()
+
+    with ENG.begin() as cx:
+        inbox_rows = (
+            cx.execute(
+                text(
+                    """
+                    SELECT inbox_id, email_address, domain, provider, daily_cap, active
+                    FROM inboxes
+                    WHERE active = TRUE
+                    """
+                )
+            )
+            .mappings()
+            .all()
+        )
+
+        # cold sends per inbox (only what *this* system has sent)
+        cold_rows = (
+            cx.execute(
+                text(
+                    """
+                    SELECT inbox_id, COUNT(*) AS sent_today
+                    FROM email_sends
+                    WHERE status='sent'
+                      AND sent_at::date = current_date
+                    GROUP BY inbox_id
+                    """
+                )
+            )
+            .all()
+        )
+        cold_by_inbox = {row[0]: row[1] for row in cold_rows}
+
+        # most recent warmup metrics per email
+        warm_rows = (
+            cx.execute(
+                text(
+                    """
+                    SELECT DISTINCT ON (email) email, metric
+                    FROM warmup_analytics
+                    ORDER BY email, ts DESC
+                    """
+                )
+            )
+            .mappings()
+            .all()
+        )
+
+        domain_caps_rows = (
+            cx.execute(
+                text(
+                    """
+                    SELECT domain, daily_cap
+                    FROM email_health
+                    """
+                )
+            )
+            .all()
+        )
+        domain_caps = {row[0]: row[1] for row in domain_caps_rows}
+
+    warm_by_email: Dict[str, int] = {}
+    for row in warm_rows:
+        email = row["email"]
+        metric = row["metric"]
+        sent_today = 0
+        try:
+            if isinstance(metric, str):
+                m = json.loads(metric)
+            else:
+                m = metric or {}
+            by_date = (
+                m.get("email_date_data", {})
+                .get(email, {})
+            )
+            day_data = by_date.get(today_str, {}) or {}
+            sent_today = int(day_data.get("sent", 0))
+        except Exception:
+            sent_today = 0
+        warm_by_email[email] = sent_today
+
+    inboxes: List[Dict[str, Any]] = []
+    for ir in inbox_rows:
+        inbox_id = ir["inbox_id"]
+        email_address = ir["email_address"]
+        domain = (ir["domain"] or "").lower()
+        provider = ir["provider"]
+        active = ir["active"]
+
+        domain_cap = domain_caps.get(domain)
+        # Base cap: inbox.daily_cap → domain_cap → global default
+        base_cap = ir["daily_cap"] or domain_cap or SEND_DAILY_CAP_DEFAULT
+
+        cold_sent = int(cold_by_inbox.get(inbox_id, 0) or 0)
+        warm_sent = int(warm_by_email.get(email_address, 0) or 0)
+        cold_remaining = max(0, base_cap - cold_sent - warm_sent)
+
+        inboxes.append(
+            {
+                "inbox_id": inbox_id,
+                "email_address": email_address,
+                "domain": domain,
+                "provider": provider,
+                "active": active,
+                "base_cap": base_cap,
+                "cold_sent_today": cold_sent,
+                "warmup_sent_today": warm_sent,
+                "cold_remaining": cold_remaining,
+            }
+        )
+
+    return inboxes
+
+
+def _choose_inbox_for_send(inboxes: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Pick an inbox that still has cold capacity today.
+
+    Strategy: among inboxes with cold_remaining > 0, pick the one with the
+    smallest cold_sent_today (simple load-balancing).
+    """
+    candidates = [ib for ib in inboxes if ib.get("cold_remaining", 0) > 0 and ib.get("active")]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda ib: ib.get("cold_sent_today", 0))
 
 # ---------- (Optional) First-party tracking helpers --------------------------
 
