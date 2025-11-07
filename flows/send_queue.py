@@ -422,13 +422,16 @@ def send_queue(batch_size: int = 1, allow_weekend: bool = True, **kwargs):
     """
     Sends up to one email per run (hard limit), with:
       - JITTER at start
-      - GLOBAL CAP via warm-up ramp (WARMUP_WEEKLY/WARMUP_START) or SEND_DAILY_CAP
+      - DAILY CAP via warm-up (WARMUP_WEEKLY/WARMUP_START) or SEND_DAILY_CAP
       - PER-DOMAIN / PER-INBOX CAPS via email_health + inboxes + warmup_analytics
       - PROBABILISTIC SPACING across remaining slots
       - Delivered telemetry into provider_events
       - Discord alerts on cap hits (if configured)
     """
-    logger = get_run_logger()
+    try:
+        logger = get_run_logger()
+    except Exception:
+        logger = logging.getLogger(__name__)
     log = logging.getLogger(__name__)
 
     _ensure_from_domain_column()
