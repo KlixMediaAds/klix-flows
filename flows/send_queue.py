@@ -7,7 +7,8 @@ import random
 import smtplib
 import logging
 import datetime as dt
-from typing import Optional
+import json
+from typing import Optional, List, Dict, Any
 from urllib.parse import quote as urlquote
 
 from email.mime.text import MIMEText
