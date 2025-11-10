@@ -640,4 +640,27 @@ def send_queue(batch_size: int = 1, allow_weekend: bool = True, **kwargs):
             except Exception:
                 pass
 
+        # At the end of send_queue, before `return sent_count`
+    try:
+        with ENG.begin() as cx:
+            queued_remaining = cx.execute(
+                text("SELECT COUNT(*) FROM email_sends WHERE status='queued'")
+            ).scalar_one()
+
+        summary = (
+            f"send_queue summary: sent={sent_count}, "
+            f"queued_remaining={queued_remaining}, "
+            f"batch_size_param={batch_size}, "
+            f"effective_batch={effective_batch}, "
+            f"cap_today={cap_today}, "
+            f"total_load_today={total_load_today}"
+        )
+        logger.info(summary)
+        try:
+            post_discord(summary)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error("Failed to emit send_queue summary: %s", e)
+
     return sent_count
