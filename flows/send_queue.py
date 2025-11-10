@@ -16,7 +16,7 @@ from email.mime.multipart import MIMEMultipart
 
 import psycopg2
 from sqlalchemy import create_engine, text
-from prefect import get_run_logger
+from prefect import get_run_logger, flow
 
 # Optional Discord helper (PYTHONPATH must include /opt/klix/klix-flows)
 try:
@@ -48,13 +48,13 @@ SMTP_PASS = (
 FROM_ADDR = os.getenv("SMTP_FROM") or SMTP_USER
 
 # Cadence & warm-up
-SEND_WINDOW = os.getenv("SEND_WINDOW", "13:00-21:00")     # "HH:MM-HH:MM"
-SEND_WINDOW_TZ = os.getenv("SEND_WINDOW_TZ", "local").lower()  # "local" or "utc"
-SLOT_SECONDS = int(os.getenv("SEND_SLOT_SECONDS", "300")) # align with cron (*/5 -> 300)
-SEND_JITTER_MAX = int(os.getenv("SEND_JITTER_MAX", "0"))  # extra sleep at start (sec)
+SEND_WINDOW = os.getenv("SEND_WINDOW", "13:00-21:00")          # "HH:MM-HH:MM"
+SEND_WINDOW_TZ = os.getenv("SEND_WINDOW_TZ", "local").lower() # "local" or "utc"
+SLOT_SECONDS = int(os.getenv("SEND_SLOT_SECONDS", "300"))      # align with cron (*/5 -> 300)
+SEND_JITTER_MAX = int(os.getenv("SEND_JITTER_MAX", "0"))       # extra sleep at start (sec)
 SEND_DAILY_CAP_DEFAULT = int(os.getenv("SEND_DAILY_CAP", "50"))
-WARMUP_WEEKLY = os.getenv("WARMUP_WEEKLY", "")            # e.g. "10-20,20-40,40-80,80-150"
-WARMUP_START = os.getenv("WARMUP_START", "")              # e.g. "2025-10-27" (UTC date)
+WARMUP_WEEKLY = os.getenv("WARMUP_WEEKLY", "")                 # e.g. "10-20,20-40,40-80,80-150"
+WARMUP_START = os.getenv("WARMUP_START", "")                   # e.g. "2025-10-27" (UTC date)
 
 # Live / dry-run toggle (can be overridden by Prefect param)
 LIVE_DEFAULT = os.getenv("SEND_LIVE", "1") == "1"
@@ -67,6 +67,7 @@ BATCH_HARD_LIMIT = 1
 
 # ---------- INTERNAL DB NORMALIZATION (for psycopg2 use) ---------------------
 
+
 def _normalize_db(url: str) -> str:
     if not url:
         return url
@@ -78,10 +79,12 @@ def _normalize_db(url: str) -> str:
 
 # ---------- TIME / WINDOW HELPERS -------------------------------------------
 
-def _now_local_or_utc():
+
+def _now_local_or_utc() -> dt.datetime:
     return dt.datetime.utcnow() if SEND_WINDOW_TZ == "utc" else dt.datetime.now()
 
-def _parse_window(window: str):
+
+def _parse_window(window: str) -> tuple[dt.datetime, dt.datetime]:
     today = _now_local_or_utc().date()
     start_s, end_s = window.split("-")
     h1, m1 = map(int, start_s.split(":"))
@@ -90,6 +93,7 @@ def _parse_window(window: str):
         dt.datetime(today.year, today.month, today.day, h1, m1),
         dt.datetime(today.year, today.month, today.day, h2, m2),
     )
+
 
 def _seconds_left_in_window(window: str) -> int:
     now = _now_local_or_utc()
@@ -100,6 +104,7 @@ def _seconds_left_in_window(window: str) -> int:
         return int((end_dt - start_dt).total_seconds())
     return int((end_dt - now).total_seconds())
 
+
 def _within_window() -> bool:
     now = _now_local_or_utc().time()
     start_dt, end_dt = _parse_window(SEND_WINDOW)
@@ -107,16 +112,20 @@ def _within_window() -> bool:
 
 # ---------- SMTP -------------------------------------------------------------
 
+
 def _smtp():
     s = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
     s.ehlo()
     try:
-        s.starttls(); s.ehlo()
+        s.starttls()
+        s.ehlo()
     except smtplib.SMTPException:
+        # Some providers may not support STARTTLS; we just continue without it.
         pass
     if SMTP_USER and SMTP_PASS:
         s.login(SMTP_USER, (SMTP_PASS or "").replace(" ", ""))
     return s
+
 
 def _send_raw(
     to_email: str,
@@ -149,16 +158,22 @@ def _send_raw(
 
 # ---------- DB HELPERS -------------------------------------------------------
 
+
 def _today_sent_count() -> int:
     with ENG.begin() as c:
-        return c.execute(text(
-            "select count(*) from email_sends where status='sent' and sent_at::date=current_date"
-        )).scalar_one()
+        return c.execute(
+            text(
+                "SELECT COUNT(*) FROM email_sends "
+                "WHERE status='sent' AND sent_at::date = current_date"
+            )
+        ).scalar_one()
+
 
 def _warmup_cap(default_cap: int) -> int:
     """
     WARMUP_WEEKLY like "10-20,20-40,40-80,80-150"
     WARMUP_START like "YYYY-MM-DD" (UTC date).
+
     Returns today's target cap inside the band's [lo, hi], stable per day.
     """
     if not WARMUP_WEEKLY or not WARMUP_START:
@@ -182,12 +197,17 @@ def _warmup_cap(default_cap: int) -> int:
     except Exception:
         return default_cap
 
+
 def _ensure_from_domain_column():
     try:
         with ENG.begin() as c:
-            c.execute(text("ALTER TABLE email_sends ADD COLUMN IF NOT EXISTS from_domain text"))
+            c.execute(
+                text("ALTER TABLE email_sends ADD COLUMN IF NOT EXISTS from_domain text")
+            )
     except Exception:
+        # Don't crash flow if migration fails; it just won't populate from_domain.
         pass
+
 
 def _sender_domain() -> str:
     sender = (FROM_ADDR or SMTP_USER or "").strip()
@@ -195,37 +215,60 @@ def _sender_domain() -> str:
         return sender.split("@")[-1].lower()
     return "unknown"
 
+
 def _domain_send_ok(domain: str) -> bool:
-    """Check email_health.daily_cap by sender domain vs today's sent count for that domain."""
+    """
+    Check email_health.daily_cap by sender domain vs today's sent count for that domain.
+
+    Currently unused, but kept for possible future per-domain gating.
+    """
     db = _normalize_db(os.environ.get("DATABASE_URL", ""))
     today = dt.datetime.utcnow().date()
     with psycopg2.connect(db) as c, c.cursor() as cur:
-        cur.execute("SELECT COALESCE(daily_cap,40) FROM email_health WHERE domain=%s", (domain,))
+        cur.execute(
+            "SELECT COALESCE(daily_cap,40) FROM email_health WHERE domain=%s",
+            (domain,),
+        )
         row = cur.fetchone()
         cap = row[0] if row else 40
-        cur.execute("""
+        cur.execute(
+            """
             SELECT COUNT(*) FROM email_sends
             WHERE COALESCE(from_domain,'') = %s
               AND status='sent'
-              AND sent_at::date=%s
-        """, (domain, today))
+              AND sent_at::date = %s
+        """,
+            (domain, today),
+        )
         sent_today = cur.fetchone()[0]
         return sent_today < cap
 
-def _log_provider_event(send_id: Optional[int], event_type: str, rcpt: Optional[str], sender_domain: str, payload: Optional[dict] = None):
+
+def _log_provider_event(
+    send_id: Optional[int],
+    event_type: str,
+    rcpt: Optional[str],
+    sender_domain: str,
+    payload: Optional[dict] = None,
+):
     payload = payload or {}
     with ENG.begin() as cx:
-        cx.execute(text("""
+        cx.execute(
+            text(
+                """
             INSERT INTO provider_events(email_send_id, provider, event_type, email, domain, payload)
             VALUES (:sid, :prov, :etype, :email, :domain, :payload)
-        """), {
-            "sid": send_id,
-            "prov": "smtp",
-            "etype": event_type,
-            "email": rcpt,
-            "domain": sender_domain,
-            "payload": payload
-        })
+        """
+            ),
+            {
+                "sid": send_id,
+                "prov": "smtp",
+                "etype": event_type,
+                "email": rcpt,
+                "domain": sender_domain,
+                "payload": payload,
+            },
+        )
 
 # ---------- INBOX / WARMUP STATE HELPERS ------------------------------------
 
@@ -311,10 +354,7 @@ def _load_inbox_state() -> List[Dict[str, Any]]:
                 m = json.loads(metric)
             else:
                 m = metric or {}
-            by_date = (
-                m.get("email_date_data", {})
-                .get(email, {})
-            )
+            by_date = m.get("email_date_data", {}).get(email, {})
             day_data = by_date.get(today_str, {}) or {}
             sent_today = int(day_data.get("sent", 0))
         except Exception:
@@ -354,32 +394,43 @@ def _load_inbox_state() -> List[Dict[str, Any]]:
     return inboxes
 
 
-def _choose_inbox_for_send(inboxes: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _choose_inbox_for_send(
+    inboxes: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
     """
     Pick an inbox that still has cold capacity today.
 
     Strategy: among inboxes with cold_remaining > 0, pick the one with the
     smallest cold_sent_today (simple load-balancing).
     """
-    candidates = [ib for ib in inboxes if ib.get("cold_remaining", 0) > 0 and ib.get("active")]
+    candidates = [
+        ib for ib in inboxes if ib.get("cold_remaining", 0) > 0 and ib.get("active")
+    ]
     if not candidates:
         return None
     return min(candidates, key=lambda ib: ib.get("cold_sent_today", 0))
 
 # ---------- (Optional) First-party tracking helpers --------------------------
 
+
 URL_RE = re.compile(r'(https?://[^\s<>"\'\)]+)')
+
 
 def _wrap_click(url: str, send_id: int) -> str:
     if not TRACKING_BASE:
         return url
     return f"{TRACKING_BASE}/t/c?eid={send_id}&url={urlquote(url, safe='')}"
 
+
 def _append_pixel(html: str, send_id: int) -> str:
     if not TRACKING_BASE:
         return html
-    pixel = f'<img src="{TRACKING_BASE}/t/pixel?eid={send_id}" width="1" height="1" style="display:none" />'
+    pixel = (
+        f'<img src="{TRACKING_BASE}/t/pixel?eid={send_id}" '
+        f'width="1" height="1" style="display:none" />'
+    )
     return (html or "").rstrip() + pixel
+
 
 def _make_bodies_for_send(send_id: int, body: str) -> tuple[str, Optional[str]]:
     """
@@ -393,14 +444,16 @@ def _make_bodies_for_send(send_id: int, body: str) -> tuple[str, Optional[str]]:
         first_url = m.group(1)
 
     body_html = None
+    # naive heuristic for "already HTML"
     if "<html" in body.lower() or "</p>" in body.lower() or "</br>" in body.lower():
         body_html = body  # already HTML-ish
     else:
         # basic auto-HTML
-        safe = (body_text
-                .replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;"))
+        safe = (
+            body_text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
         safe = safe.replace("\n", "<br>")
         body_html = f"<html><body>{safe}</body></html>"
 
@@ -418,7 +471,9 @@ def _make_bodies_for_send(send_id: int, body: str) -> tuple[str, Optional[str]]:
 
 # ---------- FLOW ENTRYPOINT --------------------------------------------------
 
-def send_queue(batch_size: int = 1, allow_weekend: bool = True, **kwargs):
+
+@flow(name="send_queue")
+def send_queue(batch_size: int = 1, allow_weekend: bool = True, **kwargs) -> int:
     """
     Sends up to one email per run (hard limit), with:
       - JITTER at start
@@ -444,21 +499,61 @@ def send_queue(batch_size: int = 1, allow_weekend: bool = True, **kwargs):
     except Exception:
         pass
 
+    logger.info(
+        "send_queue start: live=%s, window=%s (tz=%s), default_cap=%s",
+        live,
+        SEND_WINDOW,
+        SEND_WINDOW_TZ,
+        SEND_DAILY_CAP_DEFAULT,
+    )
+
+    # Guard against missing FROM_ADDR in live mode
+    if live and not FROM_ADDR:
+        msg = "SMTP_FROM / SMTP_USER is not configured; cannot send live emails."
+        logger.error(msg)
+        try:
+            post_discord(f"❌ send_queue aborted: {msg}")
+        except Exception:
+            pass
+        return 0
+
     # Weekend guard
     if not allow_weekend and dt.datetime.utcnow().weekday() >= 5:
         logger.info("Outside weekday window; exiting.")
         return 0
 
-    # Time window guard
-    if not _within_window():
-        logger.info("Outside time window (%s, tz=%s); exiting.", SEND_WINDOW, SEND_WINDOW_TZ)
+    # Time window guard (safe against bad SEND_WINDOW)
+    try:
+        in_window = _within_window()
+    except Exception as e:
+        logger.error("Invalid SEND_WINDOW %r (%s); exiting.", SEND_WINDOW, e)
+        try:
+            post_discord(f"❌ send_queue: invalid SEND_WINDOW {SEND_WINDOW}: {e}")
+        except Exception:
+            pass
         return 0
+
+    if not in_window:
+        logger.info(
+            "Outside time window (%s, tz=%s); exiting.", SEND_WINDOW, SEND_WINDOW_TZ
+        )
+        return 0
+
+    # Optional jitter at start of run to avoid clumping sends at the same second
+    if SEND_JITTER_MAX > 0 and live:
+        jitter = random.uniform(0, SEND_JITTER_MAX)
+        logger.info("Start jitter: sleeping %.1fs before processing queue", jitter)
+        time.sleep(jitter)
 
     # Load inbox + warmup state
     try:
         inboxes = _load_inbox_state()
     except Exception as e:
         logger.error("Failed to load inbox state: %s", e)
+        try:
+            post_discord(f"❌ send_queue: failed to load inbox state: {e}")
+        except Exception:
+            pass
         return 0
 
     if not inboxes:
@@ -470,6 +565,14 @@ def send_queue(batch_size: int = 1, allow_weekend: bool = True, **kwargs):
     cold_sent_total = sum(ib["cold_sent_today"] for ib in inboxes)
     warmup_total = sum(ib["warmup_sent_today"] for ib in inboxes)
     total_load_today = cold_sent_total + warmup_total
+
+    logger.info(
+        "Cap check: cap_today=%s, cold_sent_total=%s, warmup_total=%s, total_load_today=%s",
+        cap_today,
+        cold_sent_total,
+        warmup_total,
+        total_load_today,
+    )
 
     if total_load_today >= cap_today:
         msg = (
@@ -543,7 +646,9 @@ def send_queue(batch_size: int = 1, allow_weekend: bool = True, **kwargs):
         if inbox is None:
             logger.info("No inbox with remaining cold capacity; stopping sends.")
             try:
-                post_discord(":no_entry: All inbox caps exhausted for today; stopping send_queue.")
+                post_discord(
+                    ":no_entry: All inbox caps exhausted for today; stopping send_queue."
+                )
             except Exception:
                 pass
             break
@@ -591,7 +696,7 @@ def send_queue(batch_size: int = 1, allow_weekend: bool = True, **kwargs):
                                inbox_id=:iid
                          WHERE id=:id
                         """
-                    ),
+                        ),
                     {
                         "mid": provider_id,
                         "fd": sender_domain,
@@ -602,7 +707,13 @@ def send_queue(batch_size: int = 1, allow_weekend: bool = True, **kwargs):
 
             # provider_events: delivered
             try:
-                _log_provider_event(send_id, "delivered", to, sender_domain, {"via": "smtp"})
+                _log_provider_event(
+                    send_id,
+                    "delivered",
+                    to,
+                    sender_domain,
+                    {"via": "smtp", "live": live},
+                )
             except Exception:
                 pass
 
@@ -615,6 +726,7 @@ def send_queue(batch_size: int = 1, allow_weekend: bool = True, **kwargs):
             logger.info("Sent #%s to %s via %s", send_id, to, from_email)
 
         except Exception as e:
+            err_s = str(e)
             with ENG.begin() as cx:
                 cx.execute(
                     text(
@@ -628,19 +740,34 @@ def send_queue(batch_size: int = 1, allow_weekend: bool = True, **kwargs):
                         """
                     ),
                     {
-                        "err": str(e)[:300],
+                        "err": err_s[:300],
                         "fd": sender_domain,
                         "iid": inbox["inbox_id"],
                         "id": send_id,
                     },
                 )
-            logger.error("FAILED #%s to %s via %s -> %s", send_id, to, from_email, e)
+            logger.error(
+                "FAILED #%s to %s via %s -> %s", send_id, to, from_email, err_s
+            )
             try:
-                post_discord(f"❌ Send failed for id={send_id} to={to} via {from_email}: {e}")
+                post_discord(
+                    f"❌ Send failed for id={send_id} to={to} via {from_email}: {err_s}"
+                )
+            except Exception:
+                pass
+            # provider_events: failed
+            try:
+                _log_provider_event(
+                    send_id,
+                    "failed",
+                    to,
+                    sender_domain,
+                    {"error": err_s, "via": "smtp", "live": live},
+                )
             except Exception:
                 pass
 
-        # At the end of send_queue, before `return sent_count`
+    # Final summary + telemetry
     try:
         with ENG.begin() as cx:
             queued_remaining = cx.execute(
