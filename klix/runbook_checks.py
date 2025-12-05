@@ -56,6 +56,32 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _run_cmd(cmd: List[str]) -> Tuple[int, str, str]:
+    """
+    Runs a subprocess and returns rc, stdout, stderr.
+
+    Special handling for Prefect CLI:
+    - If the command starts with ["prefect", ...], rewrite it to
+      [sys.executable, "-m", "prefect", ...] so it works inside workers
+      where the 'prefect' binary may not be on PATH but the module is
+      importable.
+    """
+    import sys
+
+    full_env = os.environ.copy()
+
+    # Normalize Prefect CLI calls to `python -m prefect ...`
+    if cmd and cmd[0] == "prefect":
+        cmd = [sys.executable, "-m", "prefect", *cmd[1:]]
+
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=full_env,
+    )
+    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
     """Runs a subprocess and returns rc, stdout, stderr."""
     proc = subprocess.run(
         cmd,
