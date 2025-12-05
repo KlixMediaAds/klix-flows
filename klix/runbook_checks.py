@@ -677,42 +677,52 @@ def check_end_of_day_caps() -> StatusDict:
 # 7. Top-level aggregation
 # ---------------------------------------------------------------------------
 
-def run_all_checks() -> Tuple[Dict[str, Any], str]:
-    checks: Dict[str, StatusDict] = {
-        "env_sanity": check_env_sanity(),
-        "python_env": check_python_environment(),
-        "send_window": check_send_window_logic(),
-        "send_queue_deployment": check_send_queue_deployment(),
-        "supervisor_deployment": check_supervisor_deployment(),
-        "worker": check_worker_health(),
-        "inbox_health": check_inbox_health_7d(),
-        "angle_performance": check_angle_performance_7d(),
-        "recent_performance": check_recent_email_performance(),
-        "warmup_ratio_7d": check_warmup_ratio_7d(),
-        "fuel_gauge": check_fuel_gauge(),
-        "queue_states": check_queue_states(),
-        "daily_sends": check_daily_sends(),
-        "end_of_day_caps": check_end_of_day_caps(),
-    }
 
-    statuses = [v["status"] for v in checks.values()]
+def run_all_checks() -> tuple[dict[str, object], str]:
+    """
+    Run all registered checks and compute an overall_status.
 
-    if "critical" in statuses:
-        overall = "critical"
-    elif "warn" in statuses:
-        overall = "warn"
-    else:
-        overall = "ok"
+    Design:
+    - If ANY check is 'critical' => overall_status='critical',
+      EXCEPT for a small set of *non-plumbing* checks
+      ('env_sanity', 'send_window') which may be critical
+      for business semantics but should not bring down
+      the runbook itself.
+    - If no criticals but at least one 'warn' => 'warn'.
+    - Otherwise 'ok'.
+    """
+    snapshot_checks: dict[str, StatusDict] = {}
+
+    for name, fn in CHECKS:
+        snapshot_checks[name] = fn()
+
+    overall_status = "ok"
+
+    for name, result in snapshot_checks.items():
+        status = result.get("status", "ok")
+
+        if status == "critical":
+            # These are important, but not "plumbing is broken".
+            if name in {"env_sanity", "send_window"}:
+                if overall_status == "ok":
+                    overall_status = "warn"
+                continue
+
+            # Any other critical → hard fail.
+            overall_status = "critical"
+            break
+
+        elif status == "warn" and overall_status == "ok":
+            overall_status = "warn"
 
     snapshot = {
-        "timestamp": dt.datetime.utcnow().isoformat() + "Z",
-        "overall_status": overall,
-        "checks": checks,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "overall_status": overall_status,
+        "checks": snapshot_checks,
     }
-    return snapshot, overall
+    return snapshot, overall_status
 
 
-# CLI entrypoint
 if __name__ == "__main__":
     import json
 
