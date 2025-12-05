@@ -718,3 +718,54 @@ if __name__ == "__main__":
 
     snapshot, status = run_all_checks()
     print(json.dumps(snapshot, indent=2, default=str))
+
+
+# --- patched v4.2.1: robust send_window check ---
+def check_send_window() -> StatusDict:
+    """
+    Inspect send_queue_v2's SEND_WINDOW / SEND_WINDOW_TZ / SEND_LIVE if available.
+
+    If the flows.send_queue_v2 module is missing, treat this as a WARN,
+    not CRITICAL, so the runbook can still complete while signalling
+    the instrumentation gap.
+    """
+    issues: List[str] = []
+    details: Dict[str, Any] = {}
+
+    try:
+        from flows.send_queue_v2 import (
+            SEND_WINDOW,
+            SEND_WINDOW_TZ,
+            SEND_LIVE,
+        )  # type: ignore
+    except ModuleNotFoundError as exc:
+        details["error"] = f"import failure: {exc!r}"
+        issues.append(
+            "flows.send_queue_v2 not importable; cannot introspect send window."
+        )
+        return _make_result("warn", {"issues": issues, **details})
+    except Exception as exc:
+        details["error"] = f"unexpected import failure: {exc!r}"
+        issues.append("Unexpected error importing send_queue_v2.")
+        return _make_result("critical", {"issues": issues, **details})
+
+    details["SEND_WINDOW"] = SEND_WINDOW
+    details["SEND_WINDOW_TZ"] = SEND_WINDOW_TZ
+    details["SEND_LIVE"] = SEND_LIVE
+
+    # Mirror env expectations:
+    if SEND_LIVE != "1":
+        issues.append(
+            f"SEND_LIVE from send_queue_v2 is {SEND_LIVE!r}, expected '1'."
+        )
+    if SEND_WINDOW not in ("09:00-17:00", "09:00-17:00 "):
+        issues.append(
+            f"Unexpected SEND_WINDOW from send_queue_v2: {SEND_WINDOW!r}"
+        )
+    if SEND_WINDOW_TZ != "America/Toronto":
+        issues.append(
+            f"Unexpected SEND_WINDOW_TZ from send_queue_v2: {SEND_WINDOW_TZ!r}"
+        )
+
+    status = "ok" if not issues else "warn"
+    return _make_result(status, {**details, "issues": issues})
