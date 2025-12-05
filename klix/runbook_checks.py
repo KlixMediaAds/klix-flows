@@ -678,6 +678,25 @@ def check_end_of_day_caps() -> StatusDict:
 # ---------------------------------------------------------------------------
 
 
+
+# Ordered registry of checks: (name, function)
+CHECKS: list[tuple[str, object]] = [
+    ("env_sanity", check_env_sanity),
+    ("python_env", check_python_environment),
+    ("send_window", check_send_window_logic),
+    ("send_queue_deployment", check_send_queue_deployment),
+    ("supervisor_deployment", check_supervisor_deployment),
+    ("worker", check_worker_health),
+    ("inbox_health", check_inbox_health_7d),
+    ("angle_performance", check_angle_performance_7d),
+    ("recent_performance", check_recent_email_performance),
+    ("warmup_ratio_7d", check_warmup_ratio_7d),
+    ("fuel_gauge", check_fuel_gauge),
+    ("queue_states", check_queue_states),
+    ("daily_sends", check_daily_sends),
+    ("end_of_day_caps", check_end_of_day_caps),
+]
+
 def run_all_checks() -> tuple[dict[str, object], str]:
     """
     Run all registered checks and compute an overall_status.
