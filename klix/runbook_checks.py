@@ -1,4 +1,3 @@
-from datetime import datetime, timezone
 """
 klix.runbook_checks — Daily Runbook v4.2 (Function-Based, Automation-Ready)
 
@@ -22,6 +21,10 @@ Era 1.9.6 addition:
 """
 
 from __future__ import annotations
+
+from datetime import datetime, timezone
+
+
 
 import datetime as dt
 import os
