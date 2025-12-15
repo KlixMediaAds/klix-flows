@@ -1,134 +1,183 @@
 from __future__ import annotations
-from typing import List, Dict, Any
+
 import os
+from datetime import datetime, timezone
+from typing import Any, Dict, List
 
 from prefect import flow, get_run_logger
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
-from klix.email_builder.main import build_email_for_lead
+from klix.db import engine
 
+# -----------------------------
+# Config
+# -----------------------------
 
-def _engine():
-    url = os.environ["DATABASE_URL"]
-    return create_engine(url, pool_pre_ping=True)
+DEFAULT_LIMIT = int(os.getenv("EMAIL_BUILDER_LIMIT", "200"))
 
+# Prompt spine (required by send_queue_v2)
+DEFAULT_PROMPT_ANGLE_ID = os.getenv("COLD_DEFAULT_PROMPT_ANGLE_ID", "site-copy-hook").strip()
 
-def _existing_columns(conn, table: str) -> set[str]:
-    rows = conn.execute(
-        text(
-            """
-            select column_name
-              from information_schema.columns
-             where table_name = :t
-               and table_schema = current_schema()
-            """
-        ),
-        {"t": table},
-    ).all()
-    return {r[0] for r in rows}
+# Verification gating
+ALLOW_RISKY = os.getenv("EMAIL_BUILDER_ALLOW_RISKY", "false").lower() == "true"
+VALID_STATUSES = {"valid"}
+RISKY_STATUSES = {"risky"}
 
+# -----------------------------
+# SQL
+# -----------------------------
 
-def _fetch_candidates(limit: int) -> list[dict]:
-    e = _engine()
-    with e.begin() as c:
-        rows = list(
-            c.execute(
-                text(
-                    """
-                    select id, email, company, website, first_name, last_name, status, discovered_at
-                      from leads l
-                     where coalesce(email,'') <> ''
-                       and not exists (select 1 from email_sends s where s.lead_id = l.id)
-                     order by discovered_at desc nulls last, id desc
-                     limit :lim
-                    """
-                ),
-                {"lim": max(5 * limit, 50)},
-            ).mappings()
-        )
-    return [dict(r) for r in rows]
+SELECT_CANDIDATES_SQL = """
+SELECT
+    id AS lead_id,
+    email,
+    company,
+    website,
+    email_verification_status
+FROM leads
+WHERE email IS NOT NULL
+  AND email <> ''
+  AND email_verification_status IS NOT NULL
+ORDER BY id
+LIMIT :limit
+"""
 
+# Important: email_sends has UNIQUE (lead_id, send_type)
+# We upsert, but we do NOT overwrite sent/failed rows.
+UPSERT_SEND_SQL = """
+INSERT INTO email_sends (
+    lead_id,
+    send_type,
+    status,
+    subject,
+    body,
+    to_email,
+    prompt_angle_id,
+    created_at,
+    updated_at
+)
+VALUES (
+    :lid,
+    'cold',
+    'queued',
+    :subj,
+    :body,
+    :to_email,
+    :prompt_angle_id,
+    :ts,
+    :ts
+)
+ON CONFLICT (lead_id, send_type)
+DO UPDATE
+SET
+    status = 'queued',
+    subject = EXCLUDED.subject,
+    body = EXCLUDED.body,
+    to_email = EXCLUDED.to_email,
+    prompt_angle_id = EXCLUDED.prompt_angle_id,
+    updated_at = EXCLUDED.updated_at
+WHERE email_sends.status IN ('queued','held')
+"""
 
-@flow(name="email_builder")
-def email_builder(limit: int = 60, friendlies_domains: List[str] | None = None):
+@flow(name="email-builder")
+def email_builder_flow(limit: int = DEFAULT_LIMIT) -> int:
     """
-    Queue ALL eligible leads. Send type:
-      - 'friendly' if domain in friendlies_domains, else 'cold'
-    Inserts status='queued' and writes into body_text/body_html if present; falls back to body.
-    Also stores prompt_profile_id when available.
+    Build cold emails and enqueue them into email_sends.
+
+    HARD GUARANTEES:
+    - Verification gate enforced (valid only; risky optional).
+    - prompt_angle_id is ALWAYS set for cold sends (required by send_queue_v2).
+    - We NEVER overwrite sent/failed rows (only refresh queued/held).
     """
     logger = get_run_logger()
-    friendlies_domains = friendlies_domains or ["klixads.org", "gmail.com"]
-    friendly_set = {d.lower() for d in friendlies_domains}
 
-    cands = _fetch_candidates(limit)
-    logger.info(f"Fetched {len(cands)} candidate leads")
+    if not DEFAULT_PROMPT_ANGLE_ID:
+        raise RuntimeError("COLD_DEFAULT_PROMPT_ANGLE_ID is empty; prompt spine is required.")
 
-    queued = 0
-    eng = _engine()
-    with eng.begin() as conn:
-        cols = _existing_columns(conn, "email_sends")
-        use_text = "body_text" in cols
-        use_html = "body_html" in cols
-        use_body = "body" in cols and not (use_text or use_html)
-        has_prompt_profile_id = "prompt_profile_id" in cols
+    if limit <= 0:
+        logger.info("email_builder_flow: limit <= 0, nothing to do.")
+        return 0
 
-        for lead in cands:
-            email = (lead.get("email") or "").strip()
-            dom = email.split("@", 1)[1].lower() if "@" in email else ""
-            try:
-                subj, body_text, body_html, st_guess, prompt_profile_id = build_email_for_lead(lead)
-            except Exception as ex:
-                logger.warning(f"Builder failed for lead {lead.get('id')}: {ex}")
-                continue
+    with engine.begin() as conn:
+        leads = conn.execute(text(SELECT_CANDIDATES_SQL), {"limit": limit}).mappings().all()
 
-            send_type = st_guess or ("friendly" if dom in friendly_set else "cold")
-            fields = ["lead_id", "send_type", "status", "subject"]
-            params: Dict[str, Any] = {
-                "lead_id": lead["id"],
-                "send_type": send_type,
-                "status": "queued",
-                "subject": subj or "",
-            }
+    if not leads:
+        logger.info("email_builder_flow: no candidate leads found.")
+        return 0
 
-            # Put bodies in the right columns
-            if use_text:
-                fields.append("body_text")
-                params["body_text"] = body_text or ""
-            elif use_body:
-                fields.append("body")
-                params["body"] = body_text or ""
+    eligible: List[Dict[str, Any]] = []
+    blocked_invalid = 0
+    blocked_risky = 0
+    blocked_unknown = 0
 
-            if use_html and (body_html or ""):
-                fields.append("body_html")
-                params["body_html"] = body_html or ""
+    for l in leads:
+        status = (l.get("email_verification_status") or "").strip().lower()
+        if status in VALID_STATUSES:
+            eligible.append(l)
+        elif status in RISKY_STATUSES:
+            if ALLOW_RISKY:
+                eligible.append(l)
+            else:
+                blocked_risky += 1
+        elif status == "invalid":
+            blocked_invalid += 1
+        else:
+            blocked_unknown += 1
 
-            # NEW: store prompt_profile_id when provided
-            if has_prompt_profile_id and prompt_profile_id:
-                fields.append("prompt_profile_id")
-                params["prompt_profile_id"] = prompt_profile_id
+    logger.info(
+        "email_builder_flow: verification gate | eligible=%s invalid=%s risky_blocked=%s unknown=%s allow_risky=%s",
+        len(eligible),
+        blocked_invalid,
+        blocked_risky,
+        blocked_unknown,
+        ALLOW_RISKY,
+    )
 
-            placeholders = ",".join(f":{k}" for k in fields)
-            sql = f"""
-              insert into email_sends ({','.join(fields)}) values ({placeholders})
-              on conflict (lead_id, send_type) do nothing
-            """
-            conn.execute(text(sql), params)
+    if not eligible:
+        logger.info("email_builder_flow: no leads passed verification gate.")
+        return 0
 
-            # confirm the row exists (idempotent)
-            ok = conn.execute(
-                text(
-                    """
-                    select 1 from email_sends
-                     where lead_id = :lid and send_type = :stype
-                    """
-                ),
-                {"lid": lead["id"], "stype": send_type},
-            ).fetchone()
-            if ok:
-                queued += 1
-                if queued >= limit:
-                    break
+    queued_or_refreshed = 0
+    now_ts = datetime.now(timezone.utc)
 
-    logger.info(f"Queued {queued} emails.")
-    return queued
+    with engine.begin() as conn:
+        for lead in eligible:
+            lead_id = lead["lead_id"]
+            to_email = (lead.get("email") or "").strip()
+            company = (lead.get("company") or "").strip()
+            website = (lead.get("website") or "").strip()
+
+            ref = company or website or "your site"
+            subject = "Quick question about your website"
+            body = (
+                "Hi there,\n\n"
+                f"I was reviewing {ref} and noticed something worth flagging.\n\n"
+                "Open to a quick note?\n\n"
+                "- Josh"
+            )
+
+            res = conn.execute(
+                text(UPSERT_SEND_SQL),
+                {
+                    "lid": lead_id,
+                    "subj": subject,
+                    "body": body,
+                    "to_email": to_email,
+                    "prompt_angle_id": DEFAULT_PROMPT_ANGLE_ID,
+                    "ts": now_ts,
+                },
+            )
+
+            if (res.rowcount or 0) > 0:
+                queued_or_refreshed += 1
+
+    logger.info(
+        "email_builder_flow: queued_or_refreshed=%s prompt_angle_id=%s",
+        queued_or_refreshed,
+        DEFAULT_PROMPT_ANGLE_ID,
+    )
+    return queued_or_refreshed
+
+
+if __name__ == "__main__":
+    email_builder_flow()
