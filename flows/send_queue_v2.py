@@ -39,10 +39,7 @@ except ImportError:  # fallback for legacy CLI usage
     )
 
 # Centralized Discord alert helper (severity + context routing)
-try:
-    from .utils.discord_alerts import send_discord_alert  # type: ignore
-except ImportError:
-    from flows.utils.discord_alerts import send_discord_alert  # type: ignore
+from flows.utils.discord_alerts import send_discord_alert  # type: ignore
 
 # Provider abstraction (Era 1.8)
 from klix.providers import get_provider
