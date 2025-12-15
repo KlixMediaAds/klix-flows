@@ -546,7 +546,8 @@ def send_queue_v2_flow(
     batch_size: int = BATCH_HARD_LIMIT,
     allow_weekend: bool = True,
     dry_run: Optional[bool] = None,
-, force_send: bool = False) -> int:
+    force_send: bool = False,
+) -> int:
     logger = get_run_logger()
 
     if TEST_MODE:
