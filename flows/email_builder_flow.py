@@ -29,19 +29,24 @@ RISKY_STATUSES = {"risky"}
 
 SELECT_CANDIDATES_SQL = """
 SELECT
-    id AS lead_id,
-    email,
-    company,
-    website,
-    email_verification_status
-FROM leads
-WHERE email IS NOT NULL
-  AND email <> ''
-  AND email_verification_status IS NOT NULL
-ORDER BY id
+    l.id AS lead_id,
+    l.email,
+    l.company,
+    l.website,
+    l.email_verification_status
+FROM leads l
+WHERE l.email IS NOT NULL
+  AND l.email <> ''
+  AND l.email_verification_status IS NOT NULL
+  AND NOT EXISTS (
+        SELECT 1
+        FROM email_sends s
+        WHERE s.lead_id = l.id
+          AND s.send_type = 'cold'
+  )
+ORDER BY l.id DESC
 LIMIT :limit
 """
-
 # Important: email_sends has UNIQUE (lead_id, send_type)
 # We upsert, but we do NOT overwrite sent/failed rows.
 UPSERT_SEND_SQL = """
