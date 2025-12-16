@@ -132,17 +132,11 @@ def _claim_one_for_inbox(inbox_id) -> Optional[Dict[str, Any]]:
     return dict(row)
 
 
-def _get_lead_email(lead_id: Optional[int]) -> Optional[str]:
 def _requeue_job(send_id: int) -> None:
     """
     If a job was claimed (status='sending') but we decide not to send it,
     move it back to 'queued' so it can be picked up later by another run.
-
-    NO-OP when KLIX_DRY_RUN_MODE=true
     """
-    if os.getenv("KLIX_DRY_RUN_MODE", "").lower() in ("1", "true", "yes", "on"):
-        return
-
     with _db_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -159,14 +153,6 @@ def _requeue_job(send_id: int) -> None:
 
 
 def _finalize_ok(send_id: int, inbox: Dict[str, Any], to_email: str, provider_id: str, live: bool) -> None:
-    """
-    Mark send as successful.
-
-    NO-OP when KLIX_DRY_RUN_MODE=true
-    """
-    if os.getenv("KLIX_DRY_RUN_MODE", "").lower() in ("1", "true", "yes", "on"):
-        return
-
     domain = inbox.get("domain") or ""
     with _db_conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -196,14 +182,6 @@ def _finalize_ok(send_id: int, inbox: Dict[str, Any], to_email: str, provider_id
 
 
 def _finalize_fail(send_id: int, inbox: Dict[str, Any], to_email: str, err: str, live: bool) -> None:
-    """
-    Mark send as failed.
-
-    NO-OP when KLIX_DRY_RUN_MODE=true
-    """
-    if os.getenv("KLIX_DRY_RUN_MODE", "").lower() in ("1", "true", "yes", "on"):
-        return
-
     domain = inbox.get("domain") or ""
     with _db_conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -229,6 +207,9 @@ def _finalize_fail(send_id: int, inbox: Dict[str, Any], to_email: str, err: str,
         )
     except Exception:
         pass
+
+
+def _get_lead_email(lead_id: Optional[int]) -> Optional[str]:
     """
     Fallback to fetch the lead's email by id.
 
