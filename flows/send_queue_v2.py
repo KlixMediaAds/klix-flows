@@ -209,6 +209,21 @@ def _finalize_fail(send_id: int, inbox: Dict[str, Any], to_email: str, err: str,
         pass
 
 
+def _touch_inbox_after_send(inbox_id, now: Optional[dt.datetime] = None) -> None:
+    now = now or dt.datetime.now(dt.timezone.utc)
+    with _db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE inboxes
+               SET last_sent_at = %s,
+                   last_used_at = %s
+             WHERE inbox_id = %s
+            """,
+            (now, now, inbox_id),
+        )
+        conn.commit()
+
+
 def _get_lead_email(lead_id: Optional[int]) -> Optional[str]:
     """
     Fallback to fetch the lead's email by id.
@@ -841,6 +856,8 @@ def send_queue_v2_flow(
                 provider_id = "dry-run"
 
             _finalize_ok(send_id, inbox, to_email, provider_id, live)
+            if live:
+                _touch_inbox_after_send(inbox_id)
             _touch_domain_gate(domain)
 
             sent += 1
