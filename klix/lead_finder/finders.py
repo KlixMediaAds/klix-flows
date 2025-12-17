@@ -22,7 +22,8 @@ def _to_neon_item(row: Dict[str, Any]) -> Dict[str, Any]:
     # minimal Neon schema fields + a rich meta payload
     meta = {
         "website": row.get("website"),
-        "city": row.get("city"),
+                "website_domain": row.get("website_domain"),
+"city": row.get("city"),
         "niche": row.get("niche_search"),
         "rating": row.get("rating"),
         "ratings_total": row.get("ratings_total"),
@@ -33,7 +34,11 @@ def _to_neon_item(row: Dict[str, Any]) -> Dict[str, Any]:
         "tagline": row.get("tagline"),
         "unique_service": row.get("unique_service"),
         "vibe": row.get("vibe"),
-        "owner_name": row.get("owner_name"),
+                "tone_words": row.get("tone_words"),
+        "services": row.get("services"),
+        "about_names": row.get("about_names"),
+        "hero_product": row.get("hero_product"),
+"owner_name": row.get("owner_name"),
         "tech_stack": row.get("tech_stack"),
         "emails_all": row.get("emails_all"),
         "platform_primary": row.get("platform_primary"),

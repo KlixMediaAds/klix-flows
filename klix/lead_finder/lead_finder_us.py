@@ -12,7 +12,16 @@ from urllib.parse import urlparse, urljoin, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from bs4 import BeautifulSoup
+
 from dotenv import load_dotenv
+
+from klix.lead_finder.enrich import enrich_meta
+from klix.google.client import (
+    geocode_city,
+    places_text_search,
+    places_details,
+    GoogleApiError,
+)
 
 # ============== ENV / CONFIG =================
 load_dotenv(override=True)
@@ -39,6 +48,7 @@ logd = logging.debug
 logw = logging.warning
 
 def require_key():
+    """Early guard so CLI usage fails clearly if the key is missing."""
     if not PLACES_KEY:
         sys.exit("ERROR: Set GOOGLE_PLACES_API_KEY in a .env file next to this script.")
 
@@ -129,53 +139,6 @@ UNIQUE_CUES = CFG_FILE.get("unique_cues") or [
     "microblading","bridal","event","wholesale","subscription","refill","local",
     "small batch","cold-pressed","artisan","signature","seasonal","limited",
 ]
-
-# ============== ROBUST HTTP (retry/backoff) ==============
-def http_get_json(url, params, cfg, *, kind, debug=False):
-    retries = cfg["max_retries"]
-    backoff = cfg["retry_backoff"]
-    for attempt in range(retries + 1):
-        try:
-            r = requests.get(url, params=params, timeout=HTTP_TIMEOUT, headers=UA)
-            r.raise_for_status()
-            data = r.json()
-        except Exception as e:
-            if attempt >= retries:
-                logw(f"[WARN] {kind}: request failed after {retries} retries: {e}")
-                return None, "HTTP_ERROR"
-            sleep = backoff * (2 ** attempt)
-            logw(f"[RETRY] {kind}: network error, retrying in {sleep:.1f}s...")
-            time.sleep(sleep)
-            continue
-
-        status = data.get("status", "OK")
-        if status == "OK":
-            cfg["api_calls"] += 1
-            return data, "OK"
-
-        if status == "OVER_QUERY_LIMIT":
-            cfg["over_limit_hits"] += 1
-            cfg["api_calls"] += 1
-            cooldown = min(60, backoff * (2 ** attempt))
-            logw(f"[RATE] Google OVER_QUERY_LIMIT on {kind}. Cooling {cooldown:.1f}s...")
-            time.sleep(cooldown)
-            if attempt >= retries:
-                return None, "OVER_QUERY_LIMIT"
-            continue
-
-        if status in ("INVALID_REQUEST", "ZERO_RESULTS", "NOT_FOUND"):
-            cfg["api_calls"] += 1
-            if debug: logd(f"[DEBUG] {kind} status={status}")
-            return data, status
-
-        cfg["api_calls"] += 1
-        if attempt >= retries:
-            logw(f"[WARN] {kind}: unexpected status={status} after retries")
-            return data, status
-        sleep = backoff * (2 ** attempt)
-        logw(f"[RETRY] {kind}: status={status}, waiting {sleep:.1f}s...")
-        time.sleep(sleep)
-    return None, "UNKNOWN"
 
 # ============== DB (schema + migration) ==============
 REQUIRED_COLUMNS = [
@@ -435,7 +398,7 @@ def extract_testimonial(soup):
         logd(f"[TESTIMONIAL] blockquote fail: {e}")
     def has_reviewish(tag):
         if not tag or tag.name not in ("p","div"): return False
-        classes = tag.get("class", []); 
+        classes = tag.get("class", [])
         if isinstance(classes, str): classes = [classes]
         cls = " ".join(classes).lower()
         return any(k in cls for k in ("review","testimonial","quote"))
@@ -537,9 +500,9 @@ def parse_site_info(html, base_url=""):
         "owner_story": owner_story, "public_quote": public_quote, "owner_interests": "",
         "personal_social": personal_social, "compliment_candidate": short_handle(tagline, title, unique_service),
         "reviews_snapshot": "", "platform_primary": platform_primary,
-        "product_to_feature": product_to_feature, "differentiator": differentiator,
-        "mission_statement": mission_statement, "testimonial_quote": testimonial_quote,
-        "tech_stack": tech_stack, "emails_all": ", ".join(emails) if emails else "",
+        "product_to_feature": product_to_feature, "recent_activity": "",
+        "differentiator": differentiator, "mission_statement": mission_statement,
+        "testimonial_quote": testimonial_quote, "tech_stack": tech_stack, "emails_all": ", ".join(emails) if emails else "",
     }
 
 # --- Email verification (NeverBounce single-check) ---
@@ -638,21 +601,6 @@ def dedupe_key(name, website, phone, address):
     return f"name_only:{name_norm}"
 
 # ============== Discovery / Enrich ==============
-def places_text_search(query, pagetoken, cfg, debug=False):
-    url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-    params = {"key": PLACES_KEY, "query": query}
-    if pagetoken: params["pagetoken"] = pagetoken
-    return http_get_json(url, params, cfg, kind="textsearch", debug=debug)
-
-def place_details(place_id, cfg, debug=False):
-    url = "https://maps.googleapis.com/maps/api/place/details/json"
-    fields = "name,website,formatted_phone_number,formatted_address,rating,user_ratings_total"
-    params = {"key": PLACES_KEY, "place_id": place_id, "fields": fields}
-    data, status = http_get_json(url, params, cfg, kind="details", debug=debug)
-    if not data: return {}
-    return data.get("result", {})
-
-# -------- per-result processing (THREAD) --------
 def process_one(details, niche, city, sleep_sec):
     """Fetch site, parse, social freshness & NB verify. Returns (row_dict, niche_keywords) or None."""
     try:
@@ -671,7 +619,7 @@ def process_one(details, niche, city, sleep_sec):
         tech_stack = ""; emails_all = ""
 
         if website:
-            html = fetch_html(website); 
+            html = fetch_html(website);
             if sleep_sec: time.sleep(sleep_sec)
             if html:
                 info = parse_site_info(html, base_url=website)
@@ -861,7 +809,7 @@ def append_rows_by_tab(tab_to_rows):
         for tab, rows in tab_to_rows.items():
             if not rows: continue
             try: ws = sh.worksheet(tab)
-            except Exception: 
+            except Exception:
                 ws = sh.add_worksheet(title=tab, rows="1000", cols="60"); ws.append_row(HEADER)
             try: first_cell = ws.acell("A1").value
             except Exception: first_cell = None
@@ -872,21 +820,52 @@ def append_rows_by_tab(tab_to_rows):
     except Exception as e:
         logw(f"[SHEETS] Error: {e}"); logw(traceback.format_exc())
 
-# ============== Search helpers ==============
+# ============== Search helpers (via unified Google client) ==============
 def run_text_search(query, cfg, debug=False):
+    """
+    Run a Places Text Search using the unified Google client.
+
+    - Uses places_text_search(query, lat_lng=None, radius_m=0), which internally
+      handles pagination and retry logic.
+    - Respects cfg["max_per_query"] to cap total results.
+    """
     max_per_query = cfg["max_per_query"]
-    all_results, fetched, token = [], 0, None
-    while True:
-        data, status = places_text_search(query, token, cfg, debug=debug)
-        if not data: break
-        results = data.get("results", [])
-        for r in results:
-            all_results.append(r); fetched += 1
-            if fetched >= max_per_query: return all_results
-        token = data.get("next_page_token")
-        if not token: break
-        time.sleep(PAGE_TOKEN_WAIT)
+    all_results = []
+    fetched = 0
+
+    for r in places_text_search(
+        query=query,
+        lat_lng=None,
+        radius_m=0,
+        type_filter=None,
+    ):
+        all_results.append(r)
+        fetched += 1
+        if fetched >= max_per_query:
+            break
+
     return all_results
+
+def collect_details_for_query(results, cfg):
+    """
+    Call Places Details via the unified client for each result.
+
+    We still respect cfg["sleep"] between calls to avoid hammering the API.
+    """
+    details_list = []
+    for r in results:
+        pid = r.get("place_id")
+        if not pid:
+            continue
+        try:
+            d = places_details(pid)
+        except GoogleApiError as e:
+            logw(f"[DETAILS] Error for place_id={pid}: {e}")
+            d = {}
+        time.sleep(cfg["sleep"])
+        if d:
+            details_list.append(d)
+    return details_list
 
 # ============== City/niche processing with concurrency ==============
 def process_batch_with_threads(details_list, niche, city, cfg, csv_buffer, sheet_bucket, counters):
@@ -915,17 +894,6 @@ def process_batch_with_threads(details_list, niche, city, cfg, csv_buffer, sheet
                 sheet_bucket.setdefault(tab, []).append(row)
             results.append(row)
     return results
-
-def collect_details_for_query(results, cfg):
-    """Call place_details sequentially to respect rate limits; returns list of details dicts."""
-    details_list = []
-    for r in results:
-        pid = r.get("place_id")
-        if not pid: continue
-        d = place_details(pid, cfg)
-        time.sleep(cfg["sleep"])
-        if d: details_list.append(d)
-    return details_list
 
 def process_city_batch(niche, cities, cfg, csv_buffer, sheet_bucket, *, counters):
     start_city_window = time.time()
@@ -967,6 +935,9 @@ def main():
         "max_retries": max(0, args.max_retries),
         "retry_backoff": max(0.5, args.retry_backoff),
         "city_timeout": max(60, args.city_timeout),
+        # NOTE: api_calls/over_limit_hits are no longer tracked per-call now that
+        # Google HTTP logic lives in klix.google.client; we keep the keys only
+        # so the existing budget logging lines don't break.
         "api_calls": 0,
         "over_limit_hits": 0,
         "api_budget": max(1, args.api_budget),
@@ -1031,9 +1002,9 @@ def main():
         logi(f"✅ Run complete: {len(csv_buffer)} new leads captured.")
         logi(f"    → New-only export: {CSV_NEW_PATH} ({len(csv_write)} rows)")
         logi(f"    → FULL export:     {CSV_ALL_PATH} (all rows in DB)")
-        logi(f"[BUDGET] Approx API calls this run: {cfg['api_calls']} / {cfg['api_budget']} (~{pct}%).")
+        logi(f"[BUDGET] Approx API calls this run (deprecated counter): {cfg['api_calls']} / {cfg['api_budget']} (~{pct}%).")
         if cfg["over_limit_hits"] > 0:
-            logw(f"[RATE] OVER_QUERY_LIMIT events: {cfg['over_limit_hits']}.")
+            logw(f"[RATE] OVER_QUERY_LIMIT events (deprecated counter): {cfg['over_limit_hits']}.")
         logi(f"[FILTER] Skipped for missing/blacklisted email: {counters['skipped_no_email']}")
         logi("Tip: sort by 'score' desc to prioritize.")
 

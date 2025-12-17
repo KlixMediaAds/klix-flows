@@ -1,0 +1,27 @@
+{
+  "maps_platform": {
+    "Geocoding API": {
+      "used_by": ["klix.google.client.geocode_city"]
+    },
+    "Places API": {
+      "used_by": [
+        "klix.google.client.places_text_search",
+        "klix.google.client.places_details",
+        "lead_finder_us"
+      ]
+    },
+    "Places API (New)": {
+      "used_by": [
+        "future lead finder upgrade",
+        "v3 Places Text Search soon"
+      ]
+    }
+  },
+  "sheets_api": {
+    "Google Sheets API": {
+      "used_by": [
+        "lead_finder_us.append_to_sheet"
+      ]
+    }
+  }
+}

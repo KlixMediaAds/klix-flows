@@ -1,8 +1,8 @@
 import os
 from typing import Dict
 
-from prefect import flow, get_run_logger
 import psycopg2
+from prefect import flow, get_run_logger
 
 
 def _get_conn():
@@ -12,7 +12,7 @@ def _get_conn():
     DATABASE_URL is in SQLAlchemy form:
       postgresql+psycopg://...
 
-    For psycopg2 we just strip the '+psycopg' bit:
+    For psycopg2 we strip the '+psycopg' bit:
       postgresql://...
     """
     db_url = os.getenv("DATABASE_URL")
@@ -25,37 +25,25 @@ def _get_conn():
 
 def get_fuel_metrics() -> Dict[str, int]:
     """
-    Return the two core fuel metrics for the cold engine:
+    Core fuel metrics for the cold engine.
 
-    - eligible_leads:
-        leads that have an email, are NOT tagged as invalid, and have NEVER
-        had a successfully sent cold/friendly email_sends row.
+    eligible_leads:
+      leads with a *valid* email that have never had a sent cold/friendly.
 
-        Concretely:
-          coalesce(email, '') <> ''
-          AND (email_verification_status IS NULL OR email_verification_status <> 'invalid')
-          AND NOT EXISTS (
-            SELECT 1
-              FROM email_sends s
-             WHERE s.lead_id = l.id
-               AND s.status = 'sent'
-               AND s.send_type IN ('cold', 'friendly')
-          )
+    queued_cold:
+      queued rows that are cold.
 
-      This allows us to:
-        - Include brand-new leads (no sends at all).
-        - Re-eligible any lead that only has failed/cancelled/test sends.
-        - Exclude leads that already got a real sent cold/friendly.
-        - Exclude leads we now know are syntactically invalid.
+    queued_total:
+      all queued rows (cold + friendly).
 
-    - queued_cold:
-        email_sends rows that are queued cold emails.
+    queued_sql_candidates:
+      queued cold rows (mirrors claim SQL at the DB level; cooldown/caps are enforced later).
     """
     eligible_sql = """
         SELECT count(*) AS eligible_leads
         FROM leads l
         WHERE coalesce(l.email, '') <> ''
-          AND (l.email_verification_status IS NULL OR l.email_verification_status <> 'invalid')
+          AND coalesce(l.email_verification_status,'') = 'valid'
           AND NOT EXISTS (
             SELECT 1
               FROM email_sends s
@@ -65,8 +53,21 @@ def get_fuel_metrics() -> Dict[str, int]:
           );
     """
 
-    queued_sql = """
+    queued_cold_sql = """
         SELECT count(*) AS queued_cold
+        FROM email_sends
+        WHERE status = 'queued'
+          AND send_type = 'cold';
+    """
+
+    queued_total_sql = """
+        SELECT count(*) AS queued_total
+        FROM email_sends
+        WHERE status = 'queued';
+    """
+
+    queued_candidates_sql = """
+        SELECT count(*) AS queued_sql_candidates
         FROM email_sends
         WHERE status = 'queued'
           AND send_type = 'cold';
@@ -75,40 +76,38 @@ def get_fuel_metrics() -> Dict[str, int]:
     with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(eligible_sql)
-            eligible_row = cur.fetchone()
-            eligible = eligible_row[0] if eligible_row else 0
+            eligible = (cur.fetchone() or [0])[0] or 0
 
-            cur.execute(queued_sql)
-            queued_row = cur.fetchone()
-            queued = queued_row[0] if queued_row else 0
+            cur.execute(queued_cold_sql)
+            queued_cold = (cur.fetchone() or [0])[0] or 0
+
+            cur.execute(queued_total_sql)
+            queued_total = (cur.fetchone() or [0])[0] or 0
+
+            cur.execute(queued_candidates_sql)
+            queued_candidates = (cur.fetchone() or [0])[0] or 0
 
     return {
-        "eligible_leads": int(eligible or 0),
-        "queued_cold": int(queued or 0),
+        "eligible_leads": int(eligible),
+        "queued_cold": int(queued_cold),
+        "queued_total": int(queued_total),
+        "queued_sql_candidates": int(queued_candidates),
     }
 
 
 @flow(name="lead-fuel-gauge")
 def lead_fuel_gauge_flow() -> Dict[str, int]:
-    """
-    Prefect flow wrapper around get_fuel_metrics().
-
-    Logs the metrics for telemetry and returns them for programmatic use.
-    """
     logger = get_run_logger()
     metrics = get_fuel_metrics()
     logger.info(
-        "lead_fuel_gauge: eligible_leads=%s queued_cold=%s",
+        "lead_fuel_gauge: eligible=%s queued_cold=%s queued_total=%s queued_sql_candidates=%s",
         metrics["eligible_leads"],
         metrics["queued_cold"],
+        metrics["queued_total"],
+        metrics["queued_sql_candidates"],
     )
     return metrics
 
 
 if __name__ == "__main__":
-    # Allow quick ad-hoc runs via:
-    #   PYTHONPATH=. python -m flows.lead_fuel_gauge
-    metrics = lead_fuel_gauge_flow()
-    print(
-        f"eligible_leads={metrics['eligible_leads']} queued_cold={metrics['queued_cold']}"
-    )
+    print(lead_fuel_gauge_flow())

@@ -1,0 +1,1110 @@
+import os
+import random
+import time
+import datetime as dt
+from typing import Dict, Any, List, Optional, Tuple
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from prefect import flow, get_run_logger
+
+# ---------------------------------------------------------------------------
+# Reuse helpers + config from your existing v1 module
+# ---------------------------------------------------------------------------
+
+try:
+    # Preferred when running as a package: python -m flows.send_queue_v2
+    from .send_queue import (
+        _normalize_db,
+        _make_bodies_for_send,
+        _log_provider_event,
+        _send_raw,
+        FROM_ADDR,
+        SEND_WINDOW,
+        SEND_WINDOW_TZ,
+        LIVE_DEFAULT,
+        _within_window,
+    )
+except ImportError:  # fallback for legacy CLI usage
+    from send_queue import (  # type: ignore
+        _normalize_db,
+        _make_bodies_for_send,
+        _log_provider_event,
+        _send_raw,
+        FROM_ADDR,
+        SEND_WINDOW,
+        SEND_WINDOW_TZ,
+        LIVE_DEFAULT,
+        _within_window,
+    )
+
+# Centralized Discord alert helper (severity + context routing)
+try:
+    from .utils.discord_alerts import send_discord_alert  # type: ignore
+except ImportError:
+    from flows.utils.discord_alerts import send_discord_alert  # type: ignore
+
+# Provider abstraction (Era 1.8)
+from klix.providers import get_provider
+
+
+# ---------------------------------------------------------------------------
+# Env knobs for v2
+# ---------------------------------------------------------------------------
+
+DB_DSN = _normalize_db(os.environ.get("DATABASE_URL", ""))
+
+INBOX_SLOT_MIN_SECONDS = int(os.getenv("INBOX_SLOT_MIN_SECONDS", "600"))
+INBOX_SLOT_MAX_SECONDS = int(os.getenv("INBOX_SLOT_MAX_SECONDS", "1800"))
+SEND_JITTER_MAX = int(os.getenv("SEND_JITTER_MAX", "60"))
+BATCH_HARD_LIMIT = int(os.getenv("BATCH_HARD_LIMIT", "20"))
+
+# In-memory per-domain throttle (short-term jitter)
+DOMAIN_MIN_GAP_SECONDS = int(os.getenv("DOMAIN_MIN_GAP_SECONDS", "120"))
+_domain_last: Dict[str, dt.datetime] = {}
+
+# Test override: allow us to bypass SMTP/providers while still running the full pipeline
+TEST_MODE = os.getenv("KLIX_TEST_MODE", "false").lower() in ("1", "true", "yes", "on")
+
+# Test override for window (used separately)
+KLIX_IGNORE_WINDOW = os.getenv("KLIX_IGNORE_WINDOW", "false").lower() in ("1", "true", "yes", "on")
+
+# Governor caps
+MAX_COLD_PER_DAY = int(os.getenv("KLIX_MAX_COLD_PER_DAY", "0") or 0)
+MAX_COLD_PER_INBOX_PER_DAY = int(os.getenv("KLIX_MAX_COLD_PER_INBOX_PER_DAY", "0") or 0)
+ERROR_RATE_STOP_THRESHOLD = float(os.getenv("KLIX_ERROR_RATE_STOP_THRESHOLD", "0") or 0.0)
+
+
+# ---------------------------------------------------------------------------
+# DB helpers
+# ---------------------------------------------------------------------------
+
+def _db_conn(cursor_factory=None):
+    """
+    Basic connection helper. If cursor_factory is provided, it will be used
+    for .cursor(); otherwise default cursor is used.
+    """
+    if not DB_DSN:
+        raise RuntimeError("DATABASE_URL is not set")
+    if cursor_factory is None:
+        return psycopg2.connect(DB_DSN)
+    return psycopg2.connect(DB_DSN, cursor_factory=cursor_factory)
+
+
+def _load_active_inboxes_with_stats() -> List[Dict[str, Any]]:
+    """
+    Uses sql/get_inbox_stats_today.sql to load:
+      inbox_id, email_address, domain, daily_cap, active,
+      sent_today, last_sent_at
+      (and potentially provider_type/provider_config if the SQL includes them)
+    """
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sql_path = os.path.join(base_dir, "sql", "get_inbox_stats_today.sql")
+    with open(sql_path, "r", encoding="utf-8") as f:
+        query = f.read()
+
+    with _db_conn(cursor_factory=RealDictCursor) as conn, conn.cursor() as cur:
+        cur.execute(query)
+        rows = cur.fetchall()
+
+    for r in rows:
+        r.setdefault("sent_today", 0)
+        # last_sent_at will be a datetime with tzinfo from Postgres (TIMESTAMPTZ) or None
+    return rows
+
+
+def _claim_one_for_inbox(inbox_id) -> Optional[Dict[str, Any]]:
+    """
+    Atomically claim a single queued email_sends row using
+    FOR UPDATE SKIP LOCKED and set status='sending' + inbox_id.
+    Returns the full email_sends row as a dict, or None if none available.
+    """
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sql_path = os.path.join(base_dir, "sql", "claim_one_send_for_inbox.sql")
+    with open(sql_path, "r", encoding="utf-8") as f:
+        query = f.read()
+
+    with _db_conn(cursor_factory=RealDictCursor) as conn, conn.cursor() as cur:
+        cur.execute(query, {"inbox_id": inbox_id})
+        row = cur.fetchone()
+        conn.commit()
+
+    if not row:
+        return None
+    return dict(row)
+
+
+def _requeue_job(send_id: int) -> None:
+    """
+    If a job was claimed (status='sending') but we decide not to send it
+    (e.g., domain at cap), move it back to 'queued' so it can be picked up
+    later by another run.
+    """
+    with _db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE email_sends
+               SET status = 'queued',
+                   inbox_id = NULL,
+                   updated_at = NOW()
+             WHERE id = %s
+               AND status = 'sending'
+            """,
+            (send_id,),
+        )
+        conn.commit()
+
+
+def _finalize_ok(send_id: int, inbox: Dict[str, Any], to_email: str, provider_id: str, live: bool) -> None:
+    domain = inbox.get("domain") or ""
+    with _db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE email_sends
+               SET status = 'sent',
+                   provider_message_id = %s,
+                   sent_at = NOW(),
+                   updated_at = NOW(),
+                   from_domain = %s
+             WHERE id = %s
+            """,
+            (provider_id, domain, send_id),
+        )
+        conn.commit()
+
+    try:
+        _log_provider_event(
+            send_id,
+            "delivered",
+            to_email,
+            domain,
+            {"via": "smtp", "live": live, "engine": "send_queue_v2"},
+        )
+    except Exception:
+        pass
+
+
+def _finalize_fail(send_id: int, inbox: Dict[str, Any], to_email: str, err: str, live: bool) -> None:
+    domain = inbox.get("domain") or ""
+    with _db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE email_sends
+               SET status = 'failed',
+                   error = %s,
+                   updated_at = NOW(),
+                   from_domain = %s
+             WHERE id = %s
+            """,
+            (err[:300], domain, send_id),
+        )
+        conn.commit()
+
+    try:
+        _log_provider_event(
+            send_id,
+            "failed",
+            to_email,
+            domain,
+            {"via": "smtp", "live": live, "engine": "send_queue_v2", "error": err},
+        )
+    except Exception:
+        pass
+
+
+def _get_lead_email(lead_id: Optional[int]) -> Optional[str]:
+    """
+    Fallback to fetch the lead's email by id.
+
+    NOTE: We do not apply verification logic here; the main flow checks
+    email_verification_status explicitly per job and fails invalid leads
+    before we reach this point.
+    """
+    if not lead_id:
+        return None
+    with _db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT email FROM leads WHERE id = %s", (lead_id,))
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+# ---------------------------------------------------------------------------
+# Recipient normalization helper
+# ---------------------------------------------------------------------------
+
+def _normalize_recipient(raw: Optional[str]) -> str:
+    """
+    Normalize a recipient email address coming from email_sends / leads.
+    Handles things like:
+      - "mailto:user@example.com?subject=Hey"
+      - "user@example.com?subject=Hey&body=..."
+    """
+    addr = (raw or "").strip()
+    if not addr:
+        return ""
+    # strip mailto: if present
+    if addr.lower().startswith("mailto:"):
+        addr = addr[7:]
+    # drop everything after '?', which is where subject/body live
+    addr = addr.split("?", 1)[0]
+    return addr
+
+
+# ---------------------------------------------------------------------------
+# Governor stats helpers (24h cold sends + error rate)
+# ---------------------------------------------------------------------------
+
+def _load_recent_cold_stats(logger) -> Tuple[int, Dict[str, int], int, int, float]:
+    """
+    Returns:
+        total_cold_sent_24h (int)
+        per_inbox_cold_sent_24h (dict: inbox_id (str) -> count)
+        success_count_24h (int)
+        error_count_24h (int)
+        failure_rate (float 0..1)
+    """
+    total_cold = 0
+    per_inbox: Dict[str, int] = {}
+    success_count = 0
+    error_count = 0
+    failure_rate = 0.0
+
+    try:
+        with _db_conn(cursor_factory=RealDictCursor) as conn, conn.cursor() as cur:
+            # Total + per-inbox cold sends in last 24h
+            cur.execute(
+                """
+                SELECT inbox_id, COUNT(*) AS cnt
+                  FROM email_sends
+                 WHERE send_type = 'cold'
+                   AND status = 'sent'
+                   AND sent_at >= NOW() - INTERVAL '24 hours'
+                 GROUP BY inbox_id
+                """
+            )
+            rows = cur.fetchall()
+            for r in rows:
+                inbox_id = r["inbox_id"]
+                cnt = int(r["cnt"])
+                if inbox_id is not None:
+                    key = str(inbox_id)
+                    per_inbox[key] = cnt
+                    total_cold += cnt
+
+            # Error vs success counts in last 24h from send_events
+            cur.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN event_type = 'send_success' THEN 1 ELSE 0 END) AS success_count,
+                    SUM(CASE WHEN event_type = 'send_error' THEN 1 ELSE 0 END)   AS error_count
+                  FROM send_events
+                 WHERE created_at >= NOW() - INTERVAL '24 hours'
+                """
+            )
+            row = cur.fetchone() or {}
+            success_count = int(row.get("success_count") or 0)
+            error_count = int(row.get("error_count") or 0)
+            denom = success_count + error_count
+            if denom > 0:
+                failure_rate = error_count / denom
+
+    except Exception as e:
+        logger.error(f"send_queue_v2: failed to load recent cold stats: {e}")
+        # Fail-safe: if we cannot see stats, safest behavior is to stop this run.
+        raise
+
+    return total_cold, per_inbox, success_count, error_count, failure_rate
+
+
+# ---------------------------------------------------------------------------
+# Domain cooldown + event log helpers
+# ---------------------------------------------------------------------------
+
+def log_send_event(inbox_id, email_id, event_type: str, message: str) -> None:
+    """
+    Fire-and-forget logger into send_events.
+
+    event_type examples:
+      - 'candidate_selected'
+      - 'send_skipped_domain_cap'
+      - 'send_skipped_inbox_cap'
+      - 'send_success'
+      - 'send_error'
+      - 'test_send'
+      - 'governor_cap_reached_global'
+      - 'governor_cap_reached_inbox'
+      - 'governor_error_rate_exceeded'
+    """
+    logger = get_run_logger()
+    try:
+        with _db_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO send_events (inbox_id, email_id, event_type, message)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (inbox_id, email_id, event_type, message),
+            )
+            conn.commit()
+    except Exception as e:
+        # Don't ever hard-crash the flow because of logging
+        logger.warning(f"log_send_event failed: {e}")
+
+
+def check_and_reserve_domain_capacity(domain: str, logger, now: Optional[dt.datetime] = None) -> bool:
+    """
+    Enforce per-domain daily caps in the domains table.
+
+    Returns:
+        True  -> domain still has capacity; 1 send has been reserved.
+        False -> domain is at or above cap; caller should skip this email.
+    """
+    if not domain:
+        # If for some reason we don't have a domain, don't block sending here
+        logger.warning("check_and_reserve_domain_capacity called with empty domain; allowing send.")
+        return True
+
+    now = now or dt.datetime.now(dt.timezone.utc)
+
+    with _db_conn(cursor_factory=RealDictCursor) as conn, conn.cursor() as cur:
+        # Lock the row for this domain
+        cur.execute(
+            """
+            SELECT domain, daily_cap, sent_today, last_sent_at
+            FROM domains
+            WHERE domain = %s
+            FOR UPDATE
+            """,
+            (domain,),
+        )
+        row = cur.fetchone()
+
+        # Safety: if row somehow missing, insert it
+        if row is None:
+            cur.execute(
+                """
+                INSERT INTO domains (domain)
+                VALUES (%s)
+                ON CONFLICT (domain) DO NOTHING
+                RETURNING domain, daily_cap, sent_today, last_sent_at
+                """,
+                (domain,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                cur.execute(
+                    """
+                    SELECT domain, daily_cap, sent_today, last_sent_at
+                    FROM domains
+                    WHERE domain = %s
+                    """,
+                    (domain,),
+                )
+                row = cur.fetchone()
+
+        # If last_sent_at is from a previous day, reset sent_today
+        if row["last_sent_at"] is not None and row["last_sent_at"].date() != now.date():
+            cur.execute(
+                """
+                UPDATE domains
+                   SET sent_today = 0
+                 WHERE domain = %s
+                """,
+                (domain,),
+            )
+            row["sent_today"] = 0
+
+        daily_cap = row["daily_cap"]
+        sent_today = row["sent_today"]
+
+        if daily_cap is not None and sent_today is not None and sent_today >= daily_cap:
+            logger.info(
+                "Domain %s at cap (%s/%s); skipping candidate for this domain.",
+                domain,
+                sent_today,
+                daily_cap,
+            )
+            return False
+
+        # Reserve one send for this domain
+        cur.execute(
+            """
+            UPDATE domains
+               SET sent_today = sent_today + 1,
+                   last_sent_at = %s
+             WHERE domain = %s
+            """,
+            (now, domain),
+        )
+        conn.commit()
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Cooldown helpers
+# ---------------------------------------------------------------------------
+
+def _inbox_cooldown_ok(inbox: Dict[str, Any]) -> bool:
+    """
+    Enforces a random cooldown between INBOX_SLOT_MIN_SECONDS and
+    INBOX_SLOT_MAX_SECONDS since the last sent_at for this inbox.
+
+    Handles both tz-aware and naive datetimes from Postgres.
+    """
+    last = inbox.get("last_sent_at")
+    if not last:
+        return True
+
+    # Normalize last to UTC-aware
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=dt.timezone.utc)
+    else:
+        last = last.astimezone(dt.timezone.utc)
+
+    now = dt.datetime.now(dt.timezone.utc)
+    gap = random.randint(INBOX_SLOT_MIN_SECONDS, INBOX_SLOT_MAX_SECONDS)
+    diff = (now - last).total_seconds()
+    return diff > gap
+
+
+def _domain_cooldown_ok(domain: str) -> bool:
+    """
+    Short-term in-memory cooldown to avoid back-to-back sends to the same domain.
+    """
+    if not domain:
+        return True
+    last = _domain_last.get(domain)
+    if not last:
+        return True
+    now = dt.datetime.utcnow()
+    return (now - last).total_seconds() > DOMAIN_MIN_GAP_SECONDS
+
+
+def _touch_domain_gate(domain: str) -> None:
+    if not domain:
+        return
+    _domain_last[domain] = dt.datetime.utcnow()
+
+
+def _sleep_jitter() -> None:
+    if SEND_JITTER_MAX <= 0:
+        return
+    delay = random.uniform(0, SEND_JITTER_MAX)
+    time.sleep(delay)
+
+
+# ---------------------------------------------------------------------------
+# Provider wrapper with KLIX_TEST_MODE enforcement
+# ---------------------------------------------------------------------------
+
+def send_email_safely(
+    inbox: Dict[str, Any],
+    send_id: int,
+    to_email: str,
+    subject: str,
+    body_text: str,
+    body_html: Optional[str],
+) -> str:
+    """
+    Wrapper around the provider abstraction that enforces KLIX_TEST_MODE.
+
+    Returns a provider_id string:
+      - "smtp" / "smtp_app_pw" / etc.  -> real provider send happened
+      - "test-mode"                    -> KLIX_TEST_MODE prevented provider call,
+                                         pipeline treated as success
+    """
+    logger = get_run_logger()
+
+    # Determine provider type from inbox row; default to smtp_app_pw for Era 1.8.
+    provider_type = (inbox.get("provider_type") or "smtp_app_pw").strip().lower()
+    provider = get_provider(provider_type)
+
+    if TEST_MODE:
+        logger.info(
+            "[TEST_MODE] Skipping provider send for id=%s to=%s via %s (provider_type=%s)",
+            send_id,
+            to_email,
+            inbox.get("email_address"),
+            provider_type,
+        )
+        log_send_event(
+            inbox.get("inbox_id"),
+            send_id,
+            "test_send",
+            f"KLIX_TEST_MODE_skip_provider (provider_type={provider_type})",
+        )
+        # We return a special provider_id; upstream will still finalize_ok.
+        return "test-mode"
+
+    # Real provider send (Era 1.8: smtp_app_pw wrapping Gmail app password SMTP)
+    try:
+        result = provider.send(
+            inbox=inbox,
+            to_email=to_email,
+            subject=subject,
+            body_text=body_text,
+            body_html=body_html,
+            headers=None,
+            live=True,  # send_queue_v2 only calls this when live=True
+            send_id=send_id,
+        )
+    except Exception as e:
+        logger.error(
+            "send_queue_v2: provider %s crashed for send_id=%s -> %s",
+            provider_type,
+            send_id,
+            e,
+        )
+        raise
+
+    if not result.ok:
+        err = result.error or f"provider {result.provider_name} reported failure"
+        logger.error(
+            "send_queue_v2: provider %s reported failure for send_id=%s -> %s",
+            provider_type,
+            send_id,
+            err,
+        )
+        # The outer try/except will finalize_fail + log + Discord
+        raise RuntimeError(err)
+
+    provider_message_id = result.provider_message_id or provider_type
+    return provider_message_id
+
+
+# ---------------------------------------------------------------------------
+# Core send loop
+# ---------------------------------------------------------------------------
+
+@flow(name="send-queue-v2")
+def send_queue_v2_flow(
+    batch_size: int = BATCH_HARD_LIMIT,
+    allow_weekend: bool = True,
+    dry_run: Optional[bool] = None,
+) -> int:
+    """
+    Parallel Drip Engine (v2 Core).
+
+    Each run:
+      - Respects SEND_WINDOW (+ weekend guard)
+      - Loads active inbox stats
+      - Enforces global + per-inbox cold caps
+      - Enforces error-rate governor
+      - Iterates inboxes in random order
+      - Per inbox: claim 0/1 job atomically with SKIP LOCKED
+      - Sends using that inbox's address
+      - Enforces per-inbox daily caps and cooldown
+      - Enforces per-domain DB caps + short-term cooldown
+      - Logs key events to send_events
+    """
+    logger = get_run_logger()
+
+    # TEST MODE: log but still run full pipeline (provider sends intercepted in send_email_safely)
+    if TEST_MODE:
+        logger.info("send_queue_v2: KLIX_TEST_MODE=true; provider sends will be skipped, pipeline will run.")
+
+    # Weekend guard
+    if not allow_weekend and dt.datetime.utcnow().weekday() >= 5:
+        logger.info("send_queue_v2: weekend and allow_weekend=False; exiting.")
+        return 0
+
+    # Time window guard (reuse v1 logic) with override
+    try:
+        if KLIX_IGNORE_WINDOW:
+            logger.info(
+                "send_queue_v2: KLIX_IGNORE_WINDOW=true; skipping SEND_WINDOW enforcement (%s, tz=%s).",
+                SEND_WINDOW,
+                SEND_WINDOW_TZ,
+            )
+        else:
+            if not _within_window():
+                logger.info(
+                    "send_queue_v2: outside window (%s, tz=%s); exiting.",
+                    SEND_WINDOW,
+                    SEND_WINDOW_TZ,
+                )
+                return 0
+    except Exception as e:
+        logger.error("send_queue_v2: invalid SEND_WINDOW %r (%s); exiting.", SEND_WINDOW, e)
+        return 0
+
+    # Live / dry-run
+    live = LIVE_DEFAULT
+    if dry_run is not None:
+        live = not bool(dry_run)
+
+    if live and not FROM_ADDR:
+        msg = "send_queue_v2: FROM_ADDR / SMTP_USER not configured; cannot send live emails."
+        logger.error(msg)
+        try:
+            send_discord_alert(
+                title="SEND ENGINE HALT — Missing FROM_ADDR",
+                body=msg,
+                severity="critical",
+                context={
+                    "flow": "send_queue_v2",
+                    "env": os.getenv("KLIX_ALERT_ENV_TAG", "prod"),
+                },
+            )
+        except Exception:
+            pass
+        return 0
+
+    # -----------------------------------------------------------------------
+    # Governor: 24h stats (cold sends + error rate)
+    # -----------------------------------------------------------------------
+    if MAX_COLD_PER_DAY > 0 or MAX_COLD_PER_INBOX_PER_DAY > 0 or ERROR_RATE_STOP_THRESHOLD > 0:
+        try:
+            (
+                total_cold_24h,
+                per_inbox_cold_24h,
+                success_24h,
+                error_24h,
+                failure_rate,
+            ) = _load_recent_cold_stats(logger)
+        except Exception:
+            # If stats are unreadable, safest behavior is to refuse to send
+            msg = "send_queue_v2: failed to load recent cold stats; governor stopping run."
+            logger.error(msg)
+            try:
+                send_discord_alert(
+                    title="SEND ENGINE HALT — Governor Stats Failed",
+                    body=msg,
+                    severity="critical",
+                    context={
+                        "flow": "send_queue_v2",
+                        "env": os.getenv("KLIX_ALERT_ENV_TAG", "prod"),
+                    },
+                )
+            except Exception:
+                pass
+            return 0
+
+        logger.info(
+            "send_queue_v2: governor stats — cold_24h=%s, success_24h=%s, error_24h=%s, failure_rate=%.3f",
+            total_cold_24h,
+            success_24h,
+            error_24h,
+            failure_rate,
+        )
+
+        # Error-rate governor
+        if ERROR_RATE_STOP_THRESHOLD > 0 and (success_24h + error_24h) > 0:
+            if failure_rate >= ERROR_RATE_STOP_THRESHOLD:
+                msg = (
+                    f"send_queue_v2: failure_rate={failure_rate:.3f} "
+                    f">= {ERROR_RATE_STOP_THRESHOLD:.3f}; governor halting run."
+                )
+                logger.error(msg)
+                log_send_event(
+                    None,
+                    None,
+                    "governor_error_rate_exceeded",
+                    msg,
+                )
+                try:
+                    send_discord_alert(
+                        title="SEND ENGINE HALT — Error Rate Governor",
+                        body=msg,
+                        severity="critical",
+                        context={
+                            "flow": "send_queue_v2",
+                            "env": os.getenv("KLIX_ALERT_ENV_TAG", "prod"),
+                            "failure_rate": failure_rate,
+                            "success_24h": success_24h,
+                            "error_24h": error_24h,
+                        },
+                    )
+                except Exception:
+                    pass
+                return 0
+
+        # Global cold cap governor
+        if MAX_COLD_PER_DAY > 0 and total_cold_24h >= MAX_COLD_PER_DAY:
+            msg = (
+                f"send_queue_v2: global cold cap reached — "
+                f"{total_cold_24h}/{MAX_COLD_PER_DAY} in last 24h; halting run."
+            )
+            logger.info(msg)
+            log_send_event(
+                None,
+                None,
+                "governor_cap_reached_global",
+                msg,
+            )
+            try:
+                send_discord_alert(
+                    title="SEND GOVERNOR — Global Cold Cap Reached",
+                    body=msg,
+                    severity="warning",
+                    context={
+                        "flow": "send_queue_v2",
+                        "env": os.getenv("KLIX_ALERT_ENV_TAG", "prod"),
+                    },
+                )
+            except Exception:
+                pass
+            return 0
+    else:
+        # No governor knobs configured; per-inbox stats will still be applied via daily_cap.
+        total_cold_24h = 0
+        per_inbox_cold_24h = {}
+
+    # We track additional cold sends during this run to avoid exceeding the
+    # global cap mid-run when close to the boundary.
+    cold_sent_this_run = 0
+
+    try:
+        inboxes = _load_active_inboxes_with_stats()
+    except Exception as e:
+        msg = f"send_queue_v2: failed to load inbox stats: {e}"
+        logger.error(msg)
+        try:
+            send_discord_alert(
+                title="SEND ENGINE ERROR — Inbox Stats Load Failed",
+                body=msg,
+                severity="critical",
+                context={
+                    "flow": "send_queue_v2",
+                    "env": os.getenv("KLIX_ALERT_ENV_TAG", "prod"),
+                },
+            )
+        except Exception:
+            pass
+        return 0
+
+    if not inboxes:
+        logger.info("send_queue_v2: no active inboxes; exiting.")
+        return 0
+
+    random.shuffle(inboxes)
+
+    sent = 0
+
+    # Optional global jitter once per run
+    _sleep_jitter()
+
+    for inbox in inboxes:
+        if sent >= batch_size:
+            break
+
+        if not inbox.get("active"):
+            continue
+
+        inbox_id = inbox.get("inbox_id")
+        if inbox_id is None:
+            continue
+        inbox_id_key = str(inbox_id)
+
+        # Effective per-inbox cap for today (combine DB daily_cap + governor cap)
+        daily_cap = int(inbox.get("daily_cap") or 0)
+        sent_today = int(inbox.get("sent_today") or 0)
+        cold_24h_for_inbox = int(per_inbox_cold_24h.get(inbox_id_key, 0))
+
+        if daily_cap <= 0:
+            # This inbox isn't meant to be used for cold anyway
+            continue
+
+        effective_inbox_cap = daily_cap
+        if MAX_COLD_PER_INBOX_PER_DAY > 0:
+            effective_inbox_cap = min(effective_inbox_cap, MAX_COLD_PER_INBOX_PER_DAY)
+
+        # If we've already hit the effective cap for this inbox in the last 24h, skip it
+        if cold_24h_for_inbox >= effective_inbox_cap:
+            logger.debug(
+                "send_queue_v2: inbox %s governor cap reached %s/%s",
+                inbox.get("email_address"),
+                cold_24h_for_inbox,
+                effective_inbox_cap,
+            )
+            log_send_event(
+                inbox_id,
+                None,
+                "governor_cap_reached_inbox",
+                f"inbox cold cap reached {cold_24h_for_inbox}/{effective_inbox_cap} in last 24h",
+            )
+            continue
+
+        if not _inbox_cooldown_ok(inbox):
+            continue
+
+        domain = (inbox.get("domain") or "").lower()
+        if not _domain_cooldown_ok(domain):
+            continue
+
+        job = _claim_one_for_inbox(inbox_id)
+        if not job:
+            # nothing queued for this inbox
+            continue
+
+        send_id = int(job["id"])
+        subject = (job.get("subject") or "").strip()
+        body = job.get("body") or ""
+
+        # Normalize raw to_email
+        raw_to_email = job.get("to_email")
+        to_email = _normalize_recipient(raw_to_email)
+
+        send_type = (job.get("send_type") or "").strip().lower()
+        prompt_profile_id = job.get("prompt_profile_id")
+        prompt_angle_id = job.get("prompt_angle_id")
+        lead_id = job.get("lead_id")
+
+        # -------------------------------------------------------------------
+        # Hard guard: never send to leads tagged as invalid
+        # -------------------------------------------------------------------
+        if lead_id:
+            try:
+                with _db_conn() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT email_verification_status FROM leads WHERE id = %s",
+                        (lead_id,),
+                    )
+                    row = cur.fetchone()
+                status = row[0] if row else None
+            except Exception as e:
+                # If we can't read status, safest behavior is to fail this job
+                status = "lookup_error"
+                logger.error(
+                    "send_queue_v2: failed to read email_verification_status for lead_id=%s on job %s: %s",
+                    lead_id,
+                    send_id,
+                    e,
+                )
+
+            if status == "invalid":
+                err = "lead email marked invalid by verifier"
+                logger.error(
+                    "send_queue_v2: job %s lead_id=%s has email_verification_status=invalid; failing without sending.",
+                    send_id,
+                    lead_id,
+                )
+                _finalize_fail(send_id, inbox, "", err, live=False)
+                log_send_event(
+                    inbox_id,
+                    send_id,
+                    "send_error",
+                    "lead email marked invalid; auto-failed job",
+                )
+                continue
+            elif status == "lookup_error":
+                err = "could not read email_verification_status; safest to fail job"
+                _finalize_fail(send_id, inbox, "", err, live=False)
+                log_send_event(
+                    inbox_id,
+                    send_id,
+                    "send_error",
+                    "failed to read email_verification_status; auto-failed job",
+                )
+                continue
+
+        # -------------------------------------------------------------------
+        # Prompt spine guardrail for cold emails
+        # -------------------------------------------------------------------
+        if send_type == "cold":
+            if not prompt_angle_id:
+                err = "cold email missing prompt spine (prompt_angle_id)"
+                logger.error(
+                    "send_queue_v2: job %s missing prompt spine; failing without sending.",
+                    send_id,
+                )
+                _finalize_fail(send_id, inbox, "", err, live=False)
+                log_send_event(
+                    inbox_id,
+                    send_id,
+                    "send_error",
+                    "missing_prompt_spine for cold email; auto-failed job",
+                )
+                continue
+
+            # Global cold cap guard within this run if close to boundary
+            if MAX_COLD_PER_DAY > 0:
+                if total_cold_24h + cold_sent_this_run >= MAX_COLD_PER_DAY:
+                    msg = (
+                        f"send_queue_v2: global cold cap reached mid-run — "
+                        f"{total_cold_24h + cold_sent_this_run}/{MAX_COLD_PER_DAY}; stopping."
+                    )
+                    logger.info(msg)
+                    log_send_event(
+                        None,
+                        None,
+                        "governor_cap_reached_global",
+                        msg,
+                    )
+                    try:
+                        send_discord_alert(
+                            title="SEND GOVERNOR — Global Cold Cap Reached (Mid-Run)",
+                            body=msg,
+                            severity="warning",
+                            context={
+                                "flow": "send_queue_v2",
+                                "env": os.getenv("KLIX_ALERT_ENV_TAG", "prod"),
+                            },
+                        )
+                    except Exception:
+                        pass
+                    # Put the currently-claimed job back and exit loop
+                    _requeue_job(send_id)
+                    break
+
+            # Per-inbox cold cap guard including this run
+            if cold_24h_for_inbox >= effective_inbox_cap:
+                # Should have been caught earlier, but double check before sending
+                logger.debug(
+                    "send_queue_v2: inbox %s governor cap reached %s/%s (post-claim)",
+                    inbox.get("email_address"),
+                    cold_24h_for_inbox,
+                    effective_inbox_cap,
+                )
+                log_send_event(
+                    inbox_id,
+                    send_id,
+                    "governor_cap_reached_inbox",
+                    f"inbox cold cap reached {cold_24h_for_inbox}/{effective_inbox_cap} in last 24h",
+                )
+                _requeue_job(send_id)
+                continue
+
+        # Fallback: if to_email missing but lead_id exists, look it up
+        if not to_email and lead_id:
+            lead_email = _get_lead_email(lead_id)
+            if lead_email:
+                to_email = _normalize_recipient(lead_email)
+
+        # Final sanity check: must be a valid-looking email
+        if not to_email or "@" not in to_email:
+            err = "missing or invalid recipient email"
+            logger.error("send_queue_v2: job %s has no valid to_email; failing.", send_id)
+            _finalize_fail(send_id, inbox, "", err, live=False)
+            log_send_event(
+                inbox_id,
+                send_id,
+                "send_error",
+                "missing or invalid recipient email; auto-failed job",
+            )
+            continue
+
+        # Check domain DB capacity and reserve one send
+        if not check_and_reserve_domain_capacity(domain, logger):
+            # domain at cap; put job back to queue
+            _requeue_job(send_id)
+            log_send_event(
+                inbox_id,
+                send_id,
+                "send_skipped_domain_cap",
+                f"domain {domain} at cap; requeued job",
+            )
+            continue
+
+        # Build text/html bodies (with tracking if configured)
+        body_text, body_html = _make_bodies_for_send(send_id, body)
+
+        # Additional guard: ensure we actually have content to send
+        if send_type == "cold" and not (body_text or body_html):
+            err = "cold email missing body content after _make_bodies_for_send"
+            logger.error(
+                "send_queue_v2: job %s has empty body_text/body_html after render; failing.",
+                send_id,
+            )
+            _finalize_fail(send_id, inbox, to_email, err, live=False)
+            log_send_event(
+                inbox_id,
+                send_id,
+                "send_error",
+                "missing body content for cold email; auto-failed job",
+            )
+            continue
+
+        logger.info(
+            "send_queue_v2: MAIL_PREVIEW id=%s to=%s via=%s subj=%r",
+            send_id,
+            to_email,
+            inbox.get("email_address"),
+            (subject or "")[:72],
+        )
+        log_send_event(
+            inbox_id,
+            send_id,
+            "candidate_selected",
+            f"candidate selected for {to_email} via {inbox.get('email_address')}",
+        )
+
+        try:
+            if live:
+                provider_id = send_email_safely(
+                    inbox=inbox,
+                    send_id=send_id,
+                    to_email=to_email,
+                    subject=subject,
+                    body_text=body_text,
+                    body_html=body_html,
+                )
+            else:
+                # Dry-run: no provider, but still finalize + log
+                provider_id = "dry-run"
+
+            _finalize_ok(send_id, inbox, to_email, provider_id, live)
+            _touch_domain_gate(domain)
+
+            sent += 1
+            # update in-memory stats for the rest of this run
+            inbox["sent_today"] = sent_today + 1
+            inbox["last_sent_at"] = dt.datetime.now(dt.timezone.utc)
+
+            # Update cold governor counters if this was a cold email
+            if send_type == "cold":
+                cold_sent_this_run += 1
+                per_inbox_cold_24h[inbox_id_key] = cold_24h_for_inbox + 1
+
+            logger.info(
+                "send_queue_v2: sent #%s to %s via %s (sent=%s, provider=%s)",
+                send_id,
+                to_email,
+                inbox.get("email_address"),
+                sent,
+                provider_id,
+            )
+            log_send_event(
+                inbox_id,
+                send_id,
+                "send_success",
+                f"sent to {to_email} via {inbox.get('email_address')} (provider={provider_id})",
+            )
+
+        except Exception as e:
+            err_s = str(e)
+            _finalize_fail(send_id, inbox, to_email, err_s, live)
+            logger.error(
+                "send_queue_v2: FAILED #%s to %s via %s -> %s",
+                send_id,
+                to_email,
+                inbox.get("email_address"),
+                err_s,
+            )
+            log_send_event(
+                inbox_id,
+                send_id,
+                "send_error",
+                f"error sending to {to_email} via {inbox.get('email_address')}: {err_s}",
+            )
+            try:
+                send_discord_alert(
+                    title="SEND ENGINE ERROR — Per-Email Failure",
+                    body=(
+                        f"send_queue_v2 failed for id={send_id} to {to_email} via "
+                        f"{inbox.get('email_address')}: {err_s}"
+                    ),
+                    severity="error",
+                    context={
+                        "flow": "send_queue_v2",
+                        "env": os.getenv("KLIX_ALERT_ENV_TAG", "prod"),
+                        "send_id": send_id,
+                        "inbox_id": str(inbox_id),
+                        "domain": domain,
+                    },
+                )
+            except Exception:
+                pass
+
+    logger.info("send_queue_v2: summary sent=%s (batch_size=%s)", sent, batch_size)
+    return sent

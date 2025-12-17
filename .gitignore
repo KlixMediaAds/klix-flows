@@ -5,3 +5,15 @@ __pycache__/
 .DS_Store
 *.log
 send_queue.prefect.yaml
+
+# local / runtime
+.venv/
+gmail_tokens/
+*.csv
+*.db
+backup_*/
+klix-flows-main/
+__pycache__/
+*.pyc
+*.bak_*
+*.bak

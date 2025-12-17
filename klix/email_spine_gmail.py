@@ -1,25 +1,53 @@
 from __future__ import annotations
 
-import os
 import logging
+import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, date, timezone
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional
 
-from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 
 logger = logging.getLogger(__name__)
 
-GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
-GMAIL_TOKENS_DIR = os.getenv("GMAIL_TOKENS_DIR", "/etc/klix/gmail_tokens")
+# Read-only Gmail scope
+SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+
+# Canonical token directory on the VPS (per latest landmark)
+TOKEN_DIR = Path(os.environ.get("GMAIL_TOKEN_DIR", "/opt/klix/klix-flows/gmail_tokens"))
+
+# Logical account identifiers used in DB + state tables
+ACCOUNT_EMAILS: Dict[str, str] = {
+    # PERSONAL / CORE INBOXES
+    "kolasajosh": "kolasajosh@gmail.com",
+    "favourdesirous": "favourdesirous@gmail.com",
+    "ads.klix": "ads.klix@gmail.com",
+
+    # SPINE INBOX FOR KLIXADS.CA COLD REPLIES
+    "spine_klixads": "spine@klixads.ca",
+
+    # COLD SENDER INBOXES (money inboxes)
+    "jess": "jess@klixads.ca",
+    "erica": "erica@klixmedia.ca",
+    "alex": "alex@klixads.org",
+    "team": "team@klixmedia.org",
+}
 
 
 @dataclass
 class RawEmail:
-    account: str
-    provider: str  # 'gmail'
+    """
+    Normalized representation of a Gmail message.
+
+    This is what flows/email_spine_poller.py will classify and persist into email_events.
+    """
+
+    account: str          # 'kolasajosh' | 'favourdesirous' | 'ads.klix' | 'jess' | 'erica' | 'alex' | 'team'
+    provider: str         # 'gmail'
     message_id: str
     thread_id: str
     received_at: datetime
@@ -28,206 +56,195 @@ class RawEmail:
     subject: str
     snippet: str
     labels: List[str]
-    payload: Dict[str, Any]
+    payload: dict         # minimal but full Gmail message resource for v1
 
 
-def _load_credentials_for_account(account: str) -> Optional[Credentials]:
+def _load_credentials(account: str) -> Credentials:
     """
-    Load OAuth credentials for the given logical account from a token JSON file.
+    Load OAuth credentials for a given logical account from TOKEN_DIR.
 
-    v1 strategy:
-    - We expect a pre-generated OAuth token file at:
-        $GMAIL_TOKENS_DIR/{account}.json
-      created via a one-time local OAuth flow.
-    - If the file is missing, we *log and skip* the account instead of crashing
-      the entire poller.
+    v1 is intentionally non-interactive:
+    - If the token file is missing, we raise a clear error.
+    - If the token is expired but refreshable, we refresh and write it back.
     """
-    token_path = os.path.join(GMAIL_TOKENS_DIR, f"{account}.json")
+    token_path = TOKEN_DIR / f"{account}.json"
 
-    if not os.path.exists(token_path):
-        logger.warning(
-            "Email spine: Gmail token file not found for account '%s': %s — skipping this account",
-            account,
-            token_path,
+    if not token_path.exists():
+        raise RuntimeError(
+            f"Gmail token for account '{account}' not found at {token_path}. "
+            "Per landmark, generate tokens via bootstrap_gmail_tokens.py and copy them here."
         )
+
+    creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+
+    if creds and creds.expired and creds.refresh_token:
+        logger.info("Refreshing Gmail token for account %s", account)
+        creds.refresh(Request())
+        token_path.write_text(creds.to_json())
+
+    if not creds or not creds.valid:
+        raise RuntimeError(f"Invalid Gmail credentials for account '{account}' at {token_path}")
+
+    return creds
+
+
+def _build_gmail_service(account: str):
+    """
+    Construct a Gmail API client for the given logical account.
+    """
+    if account not in ACCOUNT_EMAILS:
+        raise ValueError(f"Unknown Gmail account key: {account!r}")
+
+    creds = _load_credentials(account)
+    service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+    return service
+
+
+def _to_after_query(since: Optional[datetime]) -> Optional[str]:
+    """
+    Build a Gmail 'after:' date query from a precise timestamp.
+
+    Gmail only supports 'after:YYYY/MM/DD', so:
+    - we use the UTC date portion of last_received_at
+    - and then do precise filtering client-side via internalDate
+    """
+    if since is None:
         return None
 
-    try:
-        creds = Credentials.from_authorized_user_file(token_path, scopes=GMAIL_SCOPES)
-        return creds
-    except Exception as e:  # pragma: no cover
-        logger.error(
-            "Email spine: Failed to load credentials for account '%s' from %s: %s",
-            account,
-            token_path,
-            e,
-        )
-        return None
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    else:
+        since = since.astimezone(timezone.utc)
+
+    d: date = since.date()
+    return f"after:{d.year}/{d.month:02d}/{d.day:02d}"
 
 
-def _build_gmail_service(creds: Credentials):
-    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+def _parse_header(headers: Iterable[dict], name: str) -> str:
+    for h in headers:
+        if h.get("name", "").lower() == name.lower():
+            return h.get("value", "")
+    return ""
 
 
-def _parse_internal_date_ms(internal_date_ms: str) -> datetime:
+def _normalize_message(account: str, msg: dict) -> RawEmail:
     """
-    Gmail internalDate is ms since epoch as a string.
+    Convert a Gmail message resource into our RawEmail dataclass.
     """
-    ms_int = int(internal_date_ms)
-    return datetime.fromtimestamp(ms_int / 1000.0, tz=timezone.utc)
+    msg_id = msg.get("id", "")
+    thread_id = msg.get("threadId", "")
+    internal_date_ms = int(msg.get("internalDate", "0") or 0)
+    received_at = datetime.fromtimestamp(internal_date_ms / 1000.0, tz=timezone.utc)
+
+    snippet = msg.get("snippet", "") or ""
+    label_ids = msg.get("labelIds", []) or []
+
+    payload = msg.get("payload", {}) or {}
+    headers = payload.get("headers", []) or []
+
+    from_address = _parse_header(headers, "From")
+    to_address = _parse_header(headers, "To")
+    subject = _parse_header(headers, "Subject")
+
+    return RawEmail(
+        account=account,
+        provider="gmail",
+        message_id=msg_id,
+        thread_id=thread_id,
+        received_at=received_at,
+        from_address=from_address,
+        to_address=to_address,
+        subject=subject,
+        snippet=snippet,
+        labels=list(label_ids),
+        payload=msg,
+    )
 
 
-def _get_message_metadata(message: Dict[str, Any]) -> Tuple[datetime, str, str, str]:
+def fetch_messages_since(account: str, last_received_at: Optional[datetime]) -> List[RawEmail]:
     """
-    Extract received_at, from, to, subject from a Gmail message resource.
+    Fetch all Gmail messages for `account` received strictly after `last_received_at`.
+
+    - Uses a coarse 'after:YYYY/MM/DD' Gmail search to reduce load.
+    - Applies exact filtering via internalDate (ms since epoch) on the client.
+    - Restricts to INBOX and excludes spam/trash.
+    - Returns messages sorted by received_at ascending so the caller can:
+        - insert into email_events in order
+        - update email_poll_state.last_received_at to the newest timestamp
     """
-    internal_date_ms = message.get("internalDate") or "0"
-    received_at = _parse_internal_date_ms(internal_date_ms)
+    service = _build_gmail_service(account)
+    query = _to_after_query(last_received_at)
 
-    headers = message.get("payload", {}).get("headers", []) or []
-    hdr_map = {h.get("name", "").lower(): h.get("value", "") for h in headers}
+    # Compute internalDate threshold in ms for precise client-side filtering
+    after_internal_ms: Optional[int] = None
+    if last_received_at is not None:
+        if last_received_at.tzinfo is None:
+            last_received_at = last_received_at.replace(tzinfo=timezone.utc)
+        else:
+            last_received_at = last_received_at.astimezone(timezone.utc)
+        after_internal_ms = int(last_received_at.timestamp() * 1000)
 
-    from_addr = hdr_map.get("from", "")
-    to_addr = hdr_map.get("to", "")
-    subject = hdr_map.get("subject", "")
+    logger.info("Email spine: polling Gmail for account=%s query=%r", account, query)
 
-    return received_at, from_addr, to_addr, subject
-
-
-def _normalize_labels(msg: Dict[str, Any]) -> List[str]:
-    return msg.get("labelIds") or []
-
-
-def _minimal_payload(msg: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Keep only a minimal subset of Gmail fields we might want later.
-    Avoid storing full bodies in v1.
-    """
-    keys = [
-        "id",
-        "threadId",
-        "labelIds",
-        "snippet",
-        "internalDate",
-        "payload",
-        "sizeEstimate",
-        "historyId",
-    ]
-    return {k: msg.get(k) for k in keys if k in msg}
-
-
-def fetch_new_emails(
-    account: str,
-    since_internal_date_ms: Optional[int],
-    max_messages: int = 200,
-) -> Tuple[List[RawEmail], Optional[int]]:
-    """
-    Fetch new Gmail messages for a given logical account.
-
-    Args:
-        account: logical account name ('kolasajosh', 'favourdesirous', 'ads.klix')
-        since_internal_date_ms: last processed Gmail internalDate (ms) or None
-        max_messages: per-run cap to avoid backlogs
-
-    Returns:
-        (emails, new_last_internal_date_ms)
-
-        If the account is missing credentials or an error occurs, we log and
-        return ([], since_internal_date_ms) so the poller can proceed with
-        other accounts.
-    """
-    creds = _load_credentials_for_account(account)
-    if not creds:
-        # Skip this account gracefully
-        return [], since_internal_date_ms
+    messages: List[RawEmail] = []
+    page_token: Optional[str] = None
 
     try:
-        service = _build_gmail_service(creds)
+        while True:
+            list_kwargs = {
+                "userId": "me",
+                "labelIds": ["INBOX"],
+                "includeSpamTrash": False,
+                "maxResults": 500,
+            }
+            if query:
+                list_kwargs["q"] = query
+            if page_token:
+                list_kwargs["pageToken"] = page_token
 
-        user_id = "me"
-        query_parts: List[str] = []
-        # Optional: narrow to INBOX only for v1
-        query_parts.append("in:inbox")
+            resp = service.users().messages().list(**list_kwargs).execute()
+            msg_refs = resp.get("messages", []) or []
 
-        # For simplicity, we rely on internalDate filtering via 'q'
-        # Gmail does not support an exact "internalDate > X" in 'q', but we can
-        # approximate with 'newer_than' if needed. For v1, we just fetch the
-        # latest N and rely on our DB uniqueness.
-        query = " ".join(query_parts).strip()
+            if not msg_refs:
+                break
 
-        results = (
-            service.users()
-            .messages()
-            .list(userId=user_id, q=query, maxResults=max_messages)
-            .execute()
-        )
+            for ref in msg_refs:
+                msg_id = ref.get("id")
+                if not msg_id:
+                    continue
 
-        messages_meta = results.get("messages", []) or []
-        if not messages_meta:
-            return [], since_internal_date_ms
+                msg = (
+                    service.users()
+                    .messages()
+                    .get(userId="me", id=msg_id, format="full")
+                    .execute()
+                )
 
-        emails: List[RawEmail] = []
-        max_internal_ms_seen = since_internal_date_ms or 0
+                internal_ms = int(msg.get("internalDate", "0") or 0)
+                if after_internal_ms is not None and internal_ms <= after_internal_ms:
+                    # Older than or equal to our cursor; skip
+                    continue
 
-        for meta in messages_meta:
-            msg_id = meta.get("id")
-            if not msg_id:
-                continue
+                messages.append(_normalize_message(account, msg))
 
-            msg = (
-                service.users()
-                .messages()
-                .get(userId=user_id, id=msg_id, format="metadata")
-                .execute()
-            )
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
 
-            internal_date_str = msg.get("internalDate") or "0"
-            internal_ms = int(internal_date_str)
-            # Skip messages we've already processed if we have a cursor
-            if since_internal_date_ms is not None and internal_ms <= since_internal_date_ms:
-                continue
+    except HttpError as e:
+        logger.exception("Email spine: Gmail API error while polling account=%s: %s", account, e)
+        # v1: bubble to caller so the flow can record an incident
+        raise
 
-            received_at, from_addr, to_addr, subject = _get_message_metadata(msg)
-            labels = _normalize_labels(msg)
-            snippet = msg.get("snippet", "")
+    # Sort ascending to make cursor updates trivial
+    messages.sort(key=lambda m: m.received_at)
+    logger.info(
+        "Email spine: poll complete for account=%s, fetched %d new messages",
+        account,
+        len(messages),
+    )
 
-            payload = _minimal_payload(msg)
+    return messages
 
-            raw = RawEmail(
-                account=account,
-                provider="gmail",
-                message_id=msg.get("id", ""),
-                thread_id=msg.get("threadId", ""),
-                received_at=received_at,
-                from_address=from_addr,
-                to_address=to_addr,
-                subject=subject,
-                snippet=snippet,
-                labels=labels,
-                payload=payload,
-            )
-            emails.append(raw)
 
-            if internal_ms > max_internal_ms_seen:
-                max_internal_ms_seen = internal_ms
-
-        # If we didn't see anything newer, keep the old cursor
-        if max_internal_ms_seen <= (since_internal_date_ms or 0):
-            return emails, since_internal_date_ms
-
-        return emails, max_internal_ms_seen
-
-    except HttpError as e:  # pragma: no cover
-        logger.error(
-            "Email spine: Gmail API error for account '%s': %s", account, e, exc_info=True
-        )
-    except Exception as e:  # pragma: no cover
-        logger.error(
-            "Email spine: unexpected error while fetching emails for '%s': %s",
-            account,
-            e,
-            exc_info=True,
-        )
-
-    # On any error, do not advance cursor to avoid losing messages.
-    return [], since_internal_date_ms
+__all__ = ["RawEmail", "fetch_messages_since"]

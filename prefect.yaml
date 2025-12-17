@@ -1,37 +1,52 @@
-name: klix-flows
-prefect-version: ">=3.0.0"
-
-pull:
-- prefect.deployments.steps.git_clone:
-    repository: "https://github.com/KlixMediaAds/klix-flows.git"
-    branch: "main"
+version: 3.0
 
 deployments:
-- name: send-queue
-  entrypoint: "flows/send_queue.py:send_queue"
-  version: "{{ git_sha }}"
-  work_pool:
-    name: klix-managed
-    job_variables: {}
-  tags: ["send"]
-  parameters:
-    batch_size: 25
-    target_per_hour: 30
-    jitter_extra_s: 20
-    business_hours: "09:00-17:00"
-    timezone: "America/Toronto"
-    friendlies_first: true
-    dry_run: false
-  schedules:
-  - interval: 600.0   # every 10 minutes
+  - name: runbook-daily
+    description: >
+      Daily 3PM ET governance runbook: env sanity, send window,
+      deployments, inbox health, angles, fuel, queue states, caps.
+    tags: [governance, runbook]
+    entrypoint: flows/runbook_daily.py:runbook_daily_flow
+    parameters: {}
+    work_pool:
+      name: klix-managed
+      job_variables:
+        working_dir: /opt/klix/klix-flows
+    schedules:
+      - cron: "0 15 * * 1-5"
+        timezone: "America/Toronto"
+        active: true
 
-- name: email-builder
-  entrypoint: "flows/email_builder_flow.py:email_builder"
-  version: "{{ git_sha }}"
-  work_pool:
-    name: klix-managed
-    job_variables: {}
-  tags: ["build"]
-  parameters:
-    limit: 25
-    friendlies_domains: ["klixads.org"]   # tweak as you like
+  - name: send-queue-v2
+    tags: [cold]
+    entrypoint: flows/send_queue_v2.py:send_queue_v2_flow
+    parameters:
+      batch_size: 1
+      allow_weekend: false
+      dry_run: false
+    work_pool:
+      name: klix-managed
+      work_queue_name: cold-drip
+      job_variables:
+        working_dir: /opt/klix/klix-flows
+    schedules:
+      - cron: "*/5 14-22 * * 1-5"
+        timezone: "America/Toronto"
+        active: true
+
+  - name: send-queue-v2-5min
+    tags: [cold]
+    entrypoint: flows/send_queue_v2.py:send_queue_v2_flow
+    parameters:
+      batch_size: 1
+      allow_weekend: false
+      dry_run: false
+    work_pool:
+      name: klix-managed
+      work_queue_name: cold-drip
+      job_variables:
+        working_dir: /opt/klix/klix-flows
+    schedules:
+      - cron: "*/5 * * * *"
+        timezone: "America/Toronto"
+        active: true

@@ -23,9 +23,6 @@ Era 1.9.6 addition:
 from __future__ import annotations
 
 from datetime import datetime, timezone
-
-
-
 import datetime as dt
 import os
 import subprocess
@@ -83,16 +80,6 @@ def _run_cmd(cmd: List[str]) -> Tuple[int, str, str]:
         stderr=subprocess.PIPE,
         text=True,
         env=full_env,
-    )
-    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
-
-    """Runs a subprocess and returns rc, stdout, stderr."""
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=os.environ.copy(),
     )
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
@@ -191,36 +178,68 @@ def check_python_environment() -> StatusDict:
 # ---------------------------------------------------------------------------
 
 def check_send_window_logic() -> StatusDict:
-    try:
-        from flows.send_queue_v2 import _within_window, SEND_WINDOW, SEND_WINDOW_TZ
-    except Exception as e:
-        return _make_result("critical", {"error": f"import failure: {e!r}"})
+    """
+    Evaluate whether we're currently inside the business-hour window
+    used by the cold send queue.
 
-    now = dt.datetime.now()
-    in_window = False
-    err: Optional[str] = None
+    Design:
+    - Try to import `_within_window`, SEND_WINDOW, SEND_WINDOW_TZ from
+      `flows.send_queue_v2` so we mirror the live flow's behavior.
+    - If the module is missing (e.g. older git clone / storage), treat
+      that as a **WARN**, not CRITICAL, so the runbook can still complete
+      while signalling the observability gap.
+    - If `_within_window()` itself blows up, that's a genuine plumbing
+      issue and is treated as CRITICAL.
+    """
+    details: Dict[str, Any] = {}
+    issues: List[str] = []
+
+    try:
+        from flows.send_queue_v2 import (  # type: ignore
+            _within_window,
+            SEND_WINDOW,
+            SEND_WINDOW_TZ,
+        )
+    except ModuleNotFoundError as exc:
+        details["error"] = f"import failure: {exc!r}"
+        details["within_window"] = None
+        issues.append(
+            "flows.send_queue_v2 not importable; treating send window check as degraded observability."
+        )
+        # Degraded, but not plumbing-broken.
+        return _make_result("warn", {**details, "issues": issues})
+    except Exception as exc:
+        details["error"] = f"unexpected import failure: {exc!r}"
+        details["within_window"] = None
+        issues.append("Unexpected error importing send_queue_v2.")
+        return _make_result("critical", {**details, "issues": issues})
+
+    now = dt.datetime.now(dt.timezone.utc)
 
     try:
         in_window = bool(_within_window())
-    except Exception as e:
-        err = repr(e)
+        details["within_window"] = in_window
+    except Exception as exc:
+        details["within_window"] = None
+        details["error"] = repr(exc)
+        issues.append("_within_window() raised unexpectedly.")
+        return _make_result("critical", {**details, "issues": issues})
 
-    details = {
-        "now": now.isoformat(),
-        "send_window": SEND_WINDOW,
-        "send_window_tz": SEND_WINDOW_TZ,
-        "within_window": in_window,
-    }
-    if err:
-        details["error"] = err
+    details.update(
+        {
+            "now": now.isoformat(),
+            "send_window": SEND_WINDOW,
+            "send_window_tz": SEND_WINDOW_TZ,
+        }
+    )
 
-    status = "ok"
-    if err:
-        status = "critical"
-    elif not in_window:
+    if in_window:
+        status = "ok"
+    else:
         status = "warn"
+        issues.append("Currently outside SEND_WINDOW.")
 
-    return _make_result(status, details)
+    return _make_result(status, {**details, "issues": issues})
 
 
 # ---------------------------------------------------------------------------
@@ -681,8 +700,6 @@ def check_end_of_day_caps() -> StatusDict:
 # 7. Top-level aggregation
 # ---------------------------------------------------------------------------
 
-
-
 # Ordered registry of checks: (name, function)
 CHECKS: list[tuple[str, object]] = [
     ("env_sanity", check_env_sanity),
@@ -700,6 +717,7 @@ CHECKS: list[tuple[str, object]] = [
     ("daily_sends", check_daily_sends),
     ("end_of_day_caps", check_end_of_day_caps),
 ]
+
 
 def run_all_checks() -> tuple[dict[str, object], str]:
     """
@@ -751,54 +769,3 @@ if __name__ == "__main__":
 
     snapshot, status = run_all_checks()
     print(json.dumps(snapshot, indent=2, default=str))
-
-
-# --- patched v4.2.1: robust send_window check ---
-def check_send_window() -> StatusDict:
-    """
-    Inspect send_queue_v2's SEND_WINDOW / SEND_WINDOW_TZ / SEND_LIVE if available.
-
-    If the flows.send_queue_v2 module is missing, treat this as a WARN,
-    not CRITICAL, so the runbook can still complete while signalling
-    the instrumentation gap.
-    """
-    issues: List[str] = []
-    details: Dict[str, Any] = {}
-
-    try:
-        from flows.send_queue_v2 import (
-            SEND_WINDOW,
-            SEND_WINDOW_TZ,
-            SEND_LIVE,
-        )  # type: ignore
-    except ModuleNotFoundError as exc:
-        details["error"] = f"import failure: {exc!r}"
-        issues.append(
-            "flows.send_queue_v2 not importable; cannot introspect send window."
-        )
-        return _make_result("warn", {"issues": issues, **details})
-    except Exception as exc:
-        details["error"] = f"unexpected import failure: {exc!r}"
-        issues.append("Unexpected error importing send_queue_v2.")
-        return _make_result("critical", {"issues": issues, **details})
-
-    details["SEND_WINDOW"] = SEND_WINDOW
-    details["SEND_WINDOW_TZ"] = SEND_WINDOW_TZ
-    details["SEND_LIVE"] = SEND_LIVE
-
-    # Mirror env expectations:
-    if SEND_LIVE != "1":
-        issues.append(
-            f"SEND_LIVE from send_queue_v2 is {SEND_LIVE!r}, expected '1'."
-        )
-    if SEND_WINDOW not in ("09:00-17:00", "09:00-17:00 "):
-        issues.append(
-            f"Unexpected SEND_WINDOW from send_queue_v2: {SEND_WINDOW!r}"
-        )
-    if SEND_WINDOW_TZ != "America/Toronto":
-        issues.append(
-            f"Unexpected SEND_WINDOW_TZ from send_queue_v2: {SEND_WINDOW_TZ!r}"
-        )
-
-    status = "ok" if not issues else "warn"
-    return _make_result(status, {**details, "issues": issues})

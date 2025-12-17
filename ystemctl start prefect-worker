@@ -1,0 +1,15 @@
+[0;1;32m●[0m prefect-worker.service - Prefect Worker (klix-process)
+     Loaded: loaded (/etc/systemd/system/prefect-worker.service; enabled; vendor preset: enabled)
+    Drop-In: /etc/systemd/system/prefect-worker.service.d
+             └─10-env.conf, 10-openai.conf, 20-db.conf, 30-send.conf, 35-send-window.conf, 36-jitter-warmup.conf, 40-smtp.conf, env.conf, override.conf
+     Active: [0;1;32mactive (running)[0m since Tue 2025-11-11 19:16:59 UTC; 1 day 22h ago
+   Main PID: 565073 (prefect)
+      Tasks: 3 (limit: 1005)
+     Memory: 72.6M
+        CPU: 2min 59.908s
+     CGroup: /system.slice/prefect-worker.service
+             └─565073 /opt/klix/venv/bin/python3 /opt/klix/venv/bin/prefect worker start -p klix-managed
+
+Nov 11 19:16:59 klix-worker systemd[1]: Started Prefect Worker (klix-process).
+Nov 11 19:17:03 klix-worker prefect[565073]: Discovered type 'process' for work pool 'klix-managed'.
+Nov 11 19:17:03 klix-worker prefect[565073]: Worker 'ProcessWorker 799228e7-6bf2-40c2-83d5-5672f316c63d' started!

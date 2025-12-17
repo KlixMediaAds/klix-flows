@@ -16,15 +16,18 @@ MAX_AGE_DAYS_DEFAULT = int(os.getenv("EMAIL_VERIFIER_MAX_AGE_DAYS", "30"))
 
 
 def _build_verifier() -> EmailVerifier:
-    """
-    Factory for the EmailVerifier.
-
-    In Phase 1 we use the mock syntax-only verifier. Later, this is where you
-    would pass a real provider API key from env, e.g. EMAIL_VERIFIER_API_KEY.
-    """
     api_key = os.getenv("EMAIL_VERIFIER_API_KEY")
-    source = os.getenv("EMAIL_VERIFIER_SOURCE", "mock-syntax")
-    return EmailVerifier(api_key=api_key, source=source)
+    source = os.getenv("EMAIL_VERIFIER_SOURCE", "dns-mx")
+
+    timeout_s = float(os.getenv("EMAIL_VERIFIER_TIMEOUT_S", "3.0"))
+    lifetime_s = float(os.getenv("EMAIL_VERIFIER_LIFETIME_S", "5.0"))
+
+    return EmailVerifier(
+        api_key=api_key,
+        source=source,
+        timeout_seconds=timeout_s,
+        lifetime_seconds=lifetime_s,
+    )
 
 
 @flow(name="email-verifier")
@@ -32,23 +35,11 @@ def email_verifier_flow(
     limit: int = BATCH_SIZE_DEFAULT,
     max_age_days: int = MAX_AGE_DAYS_DEFAULT,
 ) -> int:
-    """
-    Verify up to `limit` leads whose emails are unverified or stale.
-
-    Phase 1 is tag-only:
-    - We update leads.email_verification_* fields
-    - We DO NOT gate sending yet (that will be Phase 2)
-    """
     logger = get_run_logger()
     verifier = _build_verifier()
 
-    if limit <= 0:
-        logger.info("email_verifier_flow: limit <= 0, nothing to do.")
-        return 0
-
     cutoff_ts = datetime.now(timezone.utc) - timedelta(days=max_age_days)
 
-    # Fetch candidate leads in a single query.
     with engine.begin() as conn:
         rows = conn.execute(
             text(
@@ -73,25 +64,19 @@ def email_verifier_flow(
         logger.info("email_verifier_flow: no leads require verification.")
         return 0
 
-    logger.info(f"email_verifier_flow: loaded {len(rows)} leads for verification.")
-
-    # Run verification in Python land.
     updates = []
     counts: Dict[str, int] = {}
     now_ts = datetime.now(timezone.utc)
 
     for row in rows:
-        lead_id = row["id"]
-        email = row["email"]
-
-        result: EmailVerificationResult = verifier.verify(email)
+        result: EmailVerificationResult = verifier.verify(row["email"])
         status = result.status or "risky"
 
         counts[status] = counts.get(status, 0) + 1
 
         updates.append(
             {
-                "id": lead_id,
+                "id": row["id"],
                 "status": status,
                 "source": result.source,
                 "score": result.score,
@@ -99,7 +84,6 @@ def email_verifier_flow(
             }
         )
 
-    # Apply updates in a single transaction.
     with engine.begin() as conn:
         for u in updates:
             conn.execute(
@@ -117,18 +101,14 @@ def email_verifier_flow(
                 u,
             )
 
-    total_updated = len(updates)
     logger.info(
         "email_verifier_flow: updated %s leads (breakdown: %s)",
-        total_updated,
+        len(updates),
         counts,
     )
 
-    return total_updated
+    return len(updates)
 
 
 if __name__ == "__main__":
-    # Simple manual run helper (no deployment logic here).
-    # Useful for quick tests from the CLI:
-    #   python -m flows.email_verifier_flow
     email_verifier_flow()

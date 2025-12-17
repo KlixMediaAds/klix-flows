@@ -1,6 +1,6 @@
 """
-Website crawling and extraction utilities for Lead Engine v2.
+Crawler subsystem for Lead Engine v2.
 
-- website_crawler.py: fetch and prioritize pages per domain.
-- extractor.py: regex + LLM-based contact extraction from HTML.
+- website_crawler.py: fetches a small set of pages per domain (polite crawling)
+- extractor.py: regex extraction for emails (LLM can be layered later)
 """
