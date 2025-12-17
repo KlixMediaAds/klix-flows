@@ -23,3 +23,6 @@ __pycache__/
 *.bak_*
 gap
 invalid
+
+# python venv
+.venv/
