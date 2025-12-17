@@ -17,3 +17,9 @@ __pycache__/
 *.pyc
 *.bak_*
 *.bak
+
+# local scratch
+*.bak.*
+*.bak_*
+gap
+invalid
