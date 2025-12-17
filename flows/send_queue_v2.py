@@ -436,13 +436,20 @@ def check_and_reserve_domain_capacity(domain: str, logger, now: Optional[dt.date
 # Cooldown helpers
 # ---------------------------------------------------------------------------
 
-def _inbox_cooldown_ok(inbox: Dict[str, Any], logger=None) -> bool:
+def _inbox_cooldown_ok(inbox: Dict[str, Any], logger=None, force_send: bool = False) -> bool:
     """
     Enforces a random cooldown between INBOX_SLOT_MIN_SECONDS and
     INBOX_SLOT_MAX_SECONDS since the last sent_at for this inbox.
 
     Handles both tz-aware and naive datetimes from Postgres.
     """
+
+    # force_send bypasses inbox cooldown (used for controlled debugging / backfills)
+    if force_send:
+        if logger:
+            logger.info("send_queue_v2: force_send=True; bypassing inbox cooldown.")
+        return True
+
     if KLIX_IGNORE_COOLDOWN:
         return True
 
