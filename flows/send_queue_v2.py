@@ -744,7 +744,7 @@ def send_queue_v2_flow(
             skip_inbox_cap += 1
             continue
 
-        if not _inbox_cooldown_ok(inbox, logger=logger):
+        if not _inbox_cooldown_ok(inbox, logger=logger, force_send=force_send):
             skip_inbox_cooldown += 1
             continue
 
