@@ -847,7 +847,7 @@ def send_queue_v2_flow(
                 _mark_failed(conn, send_id, 'blocked: legacy hardcoded Josh fallback template (send_queue guard)')
                 continue
 
-# HARD GATE: denylisted bounce recipients
+            # HARD GATE: denylisted bounce recipients
             if _is_denylisted_bounce(to_email):
                 err = "blocked: recipient denylisted (bounce)"
                 _finalize_fail(send_id, inbox, to_email, err, live=False)
