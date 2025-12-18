@@ -61,6 +61,27 @@ def _is_legacy_garbage(subject: str, body: str) -> bool:
             return True
     return False
 
+
+# Hard safety: never send to known test / placeholder recipients
+SUPPRESSED_RECIPIENT_PATTERNS = [
+    r"\\bYOUREMAIL\\b",
+    r"\\bexample\\.com\\b",
+    r"\\byou\\+test\\b",
+    r"\\bfriend-test-\\d+@",
+    r"\\bbouncetest-\\d+@",
+    r"\\bdefinitely-not-a-real-domain\\b",
+    r"@klixads\\.org\\b",
+    r"@klixmedia\\.org\\b",
+    r"@klixmedia\\.ca\\b",
+]
+
+def _is_suppressed_recipient(to_email: str) -> bool:
+    t = (to_email or "").strip()
+    for pat in SUPPRESSED_RECIPIENT_PATTERNS:
+        if re.search(pat, t, flags=re.IGNORECASE):
+            return True
+    return False
+
 # ---------------------------------------------------------------------------
 # Env knobs for v2
 # ---------------------------------------------------------------------------
@@ -818,7 +839,13 @@ def send_queue_v2_flow(
             subject = (job.get("subject") or "").strip()
             body = job.get("body") or ""
             # SAFETY: refuse legacy fallback/placeholder emails
-            if _is_legacy_garbage(subject, body):
+                        # Safety: never send to test/placeholder recipients
+            if _is_suppressed_recipient(to_email):
+                _mark_failed(conn, send_id, 'blocked: suppressed_recipient: internal_address')
+                logger.warning("send_queue_v2: blocked suppressed_recipient send_id=%s to=%s", send_id, to_email)
+                continue
+
+if _is_legacy_garbage(subject, body):
                 _mark_failed(conn, send_id, 'blocked: legacy hardcoded Josh fallback template (send_queue guard)')
                 continue
 
