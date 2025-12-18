@@ -859,6 +859,27 @@ def send_queue_v2_flow(
 
             send_type = (job.get("send_type") or "").strip().lower()
             prompt_angle_id = job.get("prompt_angle_id")
+
+            # HARD GATE: require prompt profile + template provenance
+            prompt_profile_id = job.get("prompt_profile_id")
+            template_id = job.get("template_id")
+            if not (prompt_profile_id and str(prompt_profile_id).strip()):
+                err = "blocked: missing prompt_profile_id"
+                _finalize_fail(send_id, inbox, to_email, err, live=False)
+                try:
+                    log_send_event(inbox_id, send_id, "send_error", err)
+                except Exception:
+                    pass
+                continue
+
+            if not (template_id and str(template_id).strip()):
+                err = "blocked: missing template_id"
+                _finalize_fail(send_id, inbox, to_email, err, live=False)
+                try:
+                    log_send_event(inbox_id, send_id, "send_error", err)
+                except Exception:
+                    pass
+                continue
             lead_id = job.get("lead_id")
 
             # Hard guard: never send to invalid leads
