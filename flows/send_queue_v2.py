@@ -7,6 +7,7 @@ from typing import Dict, Any, List, Optional, Tuple
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from prefect import flow, get_run_logger
+import re
 
 # ---------------------------------------------------------------------------
 # Reuse helpers + config from your existing v1 module
