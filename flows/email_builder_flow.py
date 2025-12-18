@@ -38,15 +38,28 @@ FROM leads l
 WHERE l.email IS NOT NULL
   AND l.email <> ''
   AND l.email_verification_status IS NOT NULL
-  AND NOT EXISTS (
-        SELECT 1
-        FROM email_sends s
-        WHERE s.lead_id = l.id
-          AND s.send_type = 'cold'
+  AND (
+      -- brand new: no cold row exists
+      NOT EXISTS (
+          SELECT 1
+          FROM email_sends s
+          WHERE s.lead_id = l.id
+            AND s.send_type = 'cold'
+      )
+      OR
+      -- retry surface: prior cold attempt failed
+      EXISTS (
+          SELECT 1
+          FROM email_sends s
+          WHERE s.lead_id = l.id
+            AND s.send_type = 'cold'
+            AND s.status = 'failed'
+      )
   )
 ORDER BY l.id DESC
 LIMIT :limit
 """
+
 # Important: email_sends has UNIQUE (lead_id, send_type)
 # We upsert, but we do NOT overwrite sent/failed rows.
 UPSERT_SEND_SQL = """
