@@ -835,15 +835,15 @@ def send_queue_v2_flow(
                 skip_no_job += 1
                 continue
 
-            send_id = int(job["id"])
-            subject = (job.get("subject") or "").strip()
-            body = job.get("body") or ""
-            # SAFETY: refuse legacy fallback/placeholder emails
-                        # Safety: never send to test/placeholder recipients
-            if _is_suppressed_recipient(to_email):
-                _mark_failed(conn, send_id, 'blocked: suppressed_recipient: internal_address')
-                logger.warning("send_queue_v2: blocked suppressed_recipient send_id=%s to=%s", send_id, to_email)
-                continue
+send_id = int(job["id"])
+subject = (job.get("subject") or "").strip()
+body = job.get("body") or ""
+# SAFETY: refuse legacy fallback/placeholder emails
+            # Safety: never send to test/placeholder recipients
+if _is_suppressed_recipient(to_email):
+    _mark_failed(conn, send_id, 'blocked: suppressed_recipient: internal_address')
+    logger.warning("send_queue_v2: blocked suppressed_recipient send_id=%s to=%s", send_id, to_email)
+    continue
 
 if _is_legacy_garbage(subject, body):
                 _mark_failed(conn, send_id, 'blocked: legacy hardcoded Josh fallback template (send_queue guard)')
