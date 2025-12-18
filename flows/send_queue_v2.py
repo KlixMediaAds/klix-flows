@@ -44,6 +44,22 @@ from flows.utils.discord_alerts import send_discord_alert  # type: ignore
 # Provider abstraction (Era 1.8+)
 from klix.providers import get_provider
 
+
+# Hard safety: never send legacy placeholder / fallback content
+LEGACY_GARBAGE_PATTERNS = [
+    r"\b-\s*Josh\b",
+    r"Open to a quick note\?",
+    r"I was reviewing\b",
+    r"Quick question about your website",
+]
+
+def _is_legacy_garbage(subject: str, body: str) -> bool:
+    text = (subject or "") + "\n" + (body or "")
+    for pat in LEGACY_GARBAGE_PATTERNS:
+        if re.search(pat, text, flags=re.IGNORECASE):
+            return True
+    return False
+
 # ---------------------------------------------------------------------------
 # Env knobs for v2
 # ---------------------------------------------------------------------------
@@ -800,6 +816,10 @@ def send_queue_v2_flow(
             send_id = int(job["id"])
             subject = (job.get("subject") or "").strip()
             body = job.get("body") or ""
+            # SAFETY: refuse legacy fallback/placeholder emails
+            if _is_legacy_garbage(subject, body):
+                _mark_failed(conn, send_id, 'blocked: legacy hardcoded Josh fallback template (send_queue guard)')
+                continue
 
             raw_to_email = job.get("to_email")
             to_email = _normalize_recipient(raw_to_email)
