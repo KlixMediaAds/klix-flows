@@ -75,12 +75,6 @@ SUPPRESSED_RECIPIENT_PATTERNS = [
     r"@klixmedia\\.ca\\b",
 ]
 
-def _is_suppressed_recipient(to_email: str) -> bool:
-    t = (to_email or "").strip()
-    for pat in SUPPRESSED_RECIPIENT_PATTERNS:
-        if re.search(pat, t, flags=re.IGNORECASE):
-            return True
-    return False
 
 # ---------------------------------------------------------------------------
 # Env knobs for v2
@@ -835,24 +829,25 @@ def send_queue_v2_flow(
                 skip_no_job += 1
                 continue
 
-send_id = int(job["id"])
-subject = (job.get("subject") or "").strip()
-body = job.get("body") or ""
-# SAFETY: refuse legacy fallback/placeholder emails
-            # Safety: never send to test/placeholder recipients
-if _is_suppressed_recipient(to_email):
-    _mark_failed(conn, send_id, 'blocked: suppressed_recipient: internal_address')
-    logger.warning("send_queue_v2: blocked suppressed_recipient send_id=%s to=%s", send_id, to_email)
-    continue
-
-if _is_legacy_garbage(subject, body):
-                _mark_failed(conn, send_id, 'blocked: legacy hardcoded Josh fallback template (send_queue guard)')
-                continue
+            send_id = int(job["id"])
+            subject = (job.get("subject") or "").strip()
+            body = job.get("body") or ""
 
             raw_to_email = job.get("to_email")
             to_email = _normalize_recipient(raw_to_email)
 
-            # HARD GATE: denylisted bounce recipients
+            # SAFETY: refuse test/placeholder recipients
+            if _is_suppressed_recipient(to_email):
+                _mark_failed(conn, send_id, 'blocked: suppressed_recipient: internal_address')
+                logger.warning("send_queue_v2: blocked suppressed_recipient send_id=%s to=%s", send_id, to_email)
+                continue
+
+            # SAFETY: refuse legacy fallback/placeholder emails
+            if _is_legacy_garbage(subject, body):
+                _mark_failed(conn, send_id, 'blocked: legacy hardcoded Josh fallback template (send_queue guard)')
+                continue
+
+# HARD GATE: denylisted bounce recipients
             if _is_denylisted_bounce(to_email):
                 err = "blocked: recipient denylisted (bounce)"
                 _finalize_fail(send_id, inbox, to_email, err, live=False)
