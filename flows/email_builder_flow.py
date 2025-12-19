@@ -420,7 +420,6 @@ def email_builder_flow(limit: int = DEFAULT_LIMIT) -> int:
                     "prompt_profile_id": prompt_profile_id_str,
                       "template_id": template_id,
                       "model_name": model_name,
-                    "model_name": None,
                     "generation_style_seed": str(style_seed) if style_seed else None,
                     "written_by": WRITTEN_BY,
                     "ts": now_ts,
