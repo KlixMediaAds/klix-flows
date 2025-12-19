@@ -76,6 +76,34 @@ SUPPRESSED_RECIPIENT_PATTERNS = [
 ]
 
 
+def _is_suppressed_recipient(email: str) -> bool:
+    """
+    Hard safety gate: block known placeholder/test recipients.
+
+    Uses:
+      - SUPPRESSED_RECIPIENT_PATTERNS (regex patterns in this module)
+      - optional env: KLIX_SUPPRESSED_RECIPIENTS="a@b.com,c@d.com"
+    """
+    if not email:
+        return False
+
+    e = email.strip().lower()
+
+    # Env allowlist-style suppression (explicit addresses)
+    raw = os.getenv("KLIX_SUPPRESSED_RECIPIENTS", "")
+    if raw and raw.strip():
+        suppressed = {x.strip().lower() for x in raw.split(",") if x.strip()}
+        if e in suppressed:
+            return True
+
+    # Pattern suppression (placeholders / internal test domains)
+    for pat in SUPPRESSED_RECIPIENT_PATTERNS:
+        if re.search(pat, e, flags=re.IGNORECASE):
+            return True
+
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Env knobs for v2
 # ---------------------------------------------------------------------------
