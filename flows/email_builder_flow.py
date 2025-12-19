@@ -418,6 +418,8 @@ def email_builder_flow(limit: int = DEFAULT_LIMIT) -> int:
                     "to_email": to_email,
                     "prompt_angle_id": prompt_angle_id,
                     "prompt_profile_id": prompt_profile_id_str,
+                      "template_id": template_id,
+                      "model_name": model_name,
                     "model_name": None,
                     "generation_style_seed": str(style_seed) if style_seed else None,
                     "written_by": WRITTEN_BY,
