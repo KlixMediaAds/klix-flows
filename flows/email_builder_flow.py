@@ -78,6 +78,7 @@ INSERT INTO email_sends (
     to_email,
     prompt_angle_id,
     prompt_profile_id,
+    template_id,
     model_name,
     generation_style_seed,
     written_by,
@@ -93,6 +94,7 @@ VALUES (
     :to_email,
     :prompt_angle_id,
     :prompt_profile_id,
+    :template_id,
     :model_name,
     :generation_style_seed,
     :written_by,
@@ -108,6 +110,7 @@ SET
     to_email = EXCLUDED.to_email,
     prompt_angle_id = EXCLUDED.prompt_angle_id,
     prompt_profile_id = EXCLUDED.prompt_profile_id,
+    template_id = EXCLUDED.template_id,
     model_name = EXCLUDED.model_name,
     generation_style_seed = EXCLUDED.generation_style_seed,
     written_by = EXCLUDED.written_by,
@@ -117,6 +120,65 @@ SET
     updated_at = EXCLUDED.updated_at
 WHERE email_sends.status IN ('queued','held','failed')
 """
+
+
+# If the builder cannot produce provenance (prompt_profile_id), we must NOT queue.
+# We still upsert a FAILED row so the lead is accounted for and won't silently send.
+UPSERT_BLOCKED_SQL = """
+INSERT INTO email_sends (
+    lead_id,
+    send_type,
+    status,
+    subject,
+    body,
+    to_email,
+    prompt_angle_id,
+    prompt_profile_id,
+    template_id,
+    model_name,
+    generation_style_seed,
+    written_by,
+    error,
+    created_at,
+    updated_at
+)
+VALUES (
+    :lid,
+    'cold',
+    'failed',
+    :subj,
+    :body,
+    :to_email,
+    :prompt_angle_id,
+    :prompt_profile_id,
+    :template_id,
+    :model_name,
+    :generation_style_seed,
+    :written_by,
+    :error,
+    :ts,
+    :ts
+)
+ON CONFLICT (lead_id, send_type)
+DO UPDATE
+SET
+    status = 'failed',
+    subject = EXCLUDED.subject,
+    body = EXCLUDED.body,
+    to_email = EXCLUDED.to_email,
+    prompt_angle_id = EXCLUDED.prompt_angle_id,
+    prompt_profile_id = EXCLUDED.prompt_profile_id,
+    template_id = EXCLUDED.template_id,
+    model_name = EXCLUDED.model_name,
+    generation_style_seed = EXCLUDED.generation_style_seed,
+    written_by = EXCLUDED.written_by,
+    error = EXCLUDED.error,
+    provider_message_id = NULL,
+    sent_at = NULL,
+    updated_at = EXCLUDED.updated_at
+WHERE email_sends.status IN ('queued','held','failed')
+"""
+
 
 COUNT_ACTIVE_PROFILES_SQL = """
 SELECT
@@ -307,6 +369,11 @@ def email_builder_flow(limit: int = DEFAULT_LIMIT) -> int:
             subject = (subject or "").strip()
             body_text = (body_text or "").strip()
             prompt_angle_id = (prompt_angle_id or "").strip() or DEFAULT_PROMPT_ANGLE_ID
+            # Provenance / traceability (must never be blank)
+            prompt_profile_id_str = str(prompt_profile_id).strip() if prompt_profile_id else ""
+            template_id = f"angle:{prompt_angle_id}"  # until builder returns a real template_id
+            model_name = (os.getenv("KLIX_EMAIL_MODEL_NAME") or "").strip() or "unknown"
+
 
             if not prompt_angle_id:
                 build_errors += 1
@@ -318,6 +385,30 @@ def email_builder_flow(limit: int = DEFAULT_LIMIT) -> int:
                 logger.error("email_builder_flow: missing subject/body after build for lead_id=%s", lead_id)
                 continue
 
+            # HARD GATE: never queue cold sends without prompt_profile_id provenance
+            if not prompt_profile_id_str:
+                build_errors += 1
+                err = "blocked: missing prompt_profile_id (builder)"
+                logger.error("email_builder_flow: %s lead_id=%s angle=%s", err, lead_id, prompt_angle_id)
+                conn.execute(
+                    text(UPSERT_BLOCKED_SQL),
+                    {
+                        "lid": lead_id,
+                        "subj": subject,
+                        "body": body_text,
+                        "to_email": to_email,
+                        "prompt_angle_id": prompt_angle_id,
+                        "prompt_profile_id": None,
+                        "template_id": template_id,
+                        "model_name": model_name,
+                        "generation_style_seed": str(style_seed) if style_seed else None,
+                        "written_by": WRITTEN_BY,
+                        "error": err,
+                        "ts": now_ts,
+                    },
+                )
+                continue
+
             res = conn.execute(
                 text(UPSERT_SEND_SQL),
                 {
@@ -326,7 +417,7 @@ def email_builder_flow(limit: int = DEFAULT_LIMIT) -> int:
                     "body": body_text,
                     "to_email": to_email,
                     "prompt_angle_id": prompt_angle_id,
-                    "prompt_profile_id": str(prompt_profile_id) if prompt_profile_id else None,
+                    "prompt_profile_id": prompt_profile_id_str,
                     "model_name": None,
                     "generation_style_seed": str(style_seed) if style_seed else None,
                     "written_by": WRITTEN_BY,
