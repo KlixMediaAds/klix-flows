@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 
 import os
 import json
@@ -41,8 +41,8 @@ Do NOT include:
 # Deterministic scorer (NO LLMs)
 # ==============================================================================
 
-def _score_email_candidate(subject: str, body_md: str) -> tuple[float, list[str]]:
-    reasons: list[str] = []
+def _score_email_candidate(subject: str, body_md: str) -> Tuple[float, List[str]]:
+    reasons: List[str] = []
     subject = (subject or "").strip()
     body = (body_md or "").strip()
 
@@ -94,6 +94,12 @@ def _score_email_candidate(subject: str, body_md: str) -> tuple[float, list[str]
     return max(0.0, min(1.0, score)), reasons
 
 
+# Compatibility hook expected by scripts/run_email_builder_10x_diag.py
+def _score_candidate(subject: str, body_text: str, lead: Any = None) -> Tuple[float, List[str]]:
+    _ = lead
+    return _score_email_candidate(subject, body_text)
+
+
 # ==============================================================================
 # Small helpers
 # ==============================================================================
@@ -127,7 +133,7 @@ def _choose_subject(biz: Dict[str, Any]) -> str:
     return random.choice(options)
 
 
-def _fallback_rule_based(biz: Dict[str, Any]) -> Dict[str, str]:
+def _fallback_rule_based(biz: Dict[str, Any]) -> Dict[str, Any]:
     observation = _observation_from(biz)
     subject = _choose_subject(biz)
 
