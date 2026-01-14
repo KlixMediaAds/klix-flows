@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from typing import Dict, List, Any, Optional
 
 import os
@@ -36,12 +37,7 @@ Do NOT include:
 """.strip()
 
 
-# ==============================================================================
-# Small helpers
-# ==============================================================================
-
 def _observation_from(biz: Dict[str, Any]) -> str:
-    """Build a one-line observation based on the business data without using 'I noticed'."""
     name = (biz.get("BusinessName") or "").strip()
     niche = (biz.get("Niche") or "").strip()
     tagline = (biz.get("Tagline") or "").strip()
@@ -59,7 +55,6 @@ def _observation_from(biz: Dict[str, Any]) -> str:
 
 
 def _choose_subject(biz: Dict[str, Any]) -> str:
-    """Very small subject fallback when the model isn't available."""
     name = (biz.get("BusinessName") or "").strip()
     base = name or "your brand"
     options = [
@@ -72,13 +67,6 @@ def _choose_subject(biz: Dict[str, Any]) -> str:
 
 
 def _fallback_rule_based(biz: Dict[str, Any]) -> Dict[str, str]:
-    """
-    Last-resort fallback used only when:
-    - no OPENAI_API_KEY, or
-    - the API call fails repeatedly.
-
-    Intentionally avoids the old 'I noticed' phrasing.
-    """
     observation = _observation_from(biz)
     subject = _choose_subject(biz)
 
@@ -96,7 +84,6 @@ def _fallback_rule_based(biz: Dict[str, Any]) -> Dict[str, str]:
 
 
 def _normalize_model_name(name: str) -> str:
-    """Simple normalizer; right now we mostly rely on gpt-4o-mini."""
     name = (name or "").strip()
     if not name:
         return "gpt-4o-mini"
@@ -104,14 +91,12 @@ def _normalize_model_name(name: str) -> str:
 
 
 def _extract_json(text: str) -> Dict[str, Any]:
-    """Try to parse a JSON object out of the model text."""
     text = (text or "").strip()
     if not text:
         return {}
     try:
         return json.loads(text)
     except Exception:
-        # Try to grab the first {...} block
         m = re.search(r"\{.*\}", text, re.S)
         if m:
             try:
@@ -121,17 +106,7 @@ def _extract_json(text: str) -> Dict[str, Any]:
         return {}
 
 
-# ==============================================================================
-# OpenAI caller
-# ==============================================================================
-
 def _call_model(messages: List[Dict[str, Any]], model_name: str, n: int = 3):
-    """
-    Thin wrapper over OpenAI Chat Completions.
-
-    We intentionally DO NOT use the Responses API here; all prompt profiles
-    are currently pointed at gpt-4o-mini (chat-completions).
-    """
     api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key or OpenAI is None:
         return None
@@ -158,21 +133,11 @@ def _call_model(messages: List[Dict[str, Any]], model_name: str, n: int = 3):
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 8.0)
                 continue
-            # For any other hard error, just bail to fallback
             return None
     return None
 
 
-# ==============================================================================
-# Drafting
-# ==============================================================================
-
 def _build_user_prompt(biz: Dict[str, Any], angle_id: str) -> str:
-    """
-    Build the user-facing prompt block that describes the business and the angle.
-
-    The *style* and voice live in SYSTEM_TEXT (which DB profiles override).
-    """
     name = biz.get("BusinessName") or ""
     niche = biz.get("Niche") or ""
     city = biz.get("City") or ""
@@ -195,7 +160,6 @@ def _build_user_prompt(biz: Dict[str, Any], angle_id: str) -> str:
         lines.append(f"- Products/Services: {', '.join(map(str, products))}")
 
     lines.append(f"\nAngle ID: {angle_id or 'default'}")
-
     lines.append(
         "\nOutput JSON only, like:\n"
         '{\n  "subject": "Simple subject",\n  "body_md": "Single or two short paragraphs..."\n}'
@@ -204,16 +168,19 @@ def _build_user_prompt(biz: Dict[str, Any], angle_id: str) -> str:
     return "\n".join(lines)
 
 
-def draft_email(biz: Dict[str, Any], angle_id: str, model_name: str = "gpt-4o-mini") -> Dict[str, str]:
-    """
-    Main entrypoint used by klix.email_builder.main.build_email_for_lead.
+def draft_email(
+    biz: Dict[str, Any],
+    angle_id: str,
+    model_name: str = "gpt-4o-mini",
+    lead_id: Optional[int] = None,
+    profile_id: Optional[int] = None,
+    style_seed: Optional[str] = None,
+    **_kwargs: Any,
+) -> Dict[str, str]:
+    _ = lead_id
+    _ = profile_id
+    _ = style_seed
 
-    - Respects SYSTEM_TEXT as the *only* system-level voice/style definition.
-      (Builder sets SYSTEM_TEXT from email_prompt_profiles.system_text.)
-    - Avoids the old hard-coded "I noticed" templates.
-    - Returns: {"subject": "...", "body_md": "..."}.
-    """
-    # 1) If there's no API key or client, immediately return fallback
     api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key or OpenAI is None:
         return _fallback_rule_based(biz)
@@ -242,24 +209,17 @@ def draft_email(biz: Dict[str, Any], angle_id: str, model_name: str = "gpt-4o-mi
     if not candidates:
         return _fallback_rule_based(biz)
 
-    # Simple selection heuristic: choose the longest non-empty body
     best = max(candidates, key=lambda c: len(c["body_md"]))
-
-    # Enforce some caps / cleanup
-    subj = best["subject"].strip()
+    subj = best["subject"].strip()[:120]
     body = best["body_md"].strip()
 
-    # Remove obvious leading phrases we dislike if the model still used them
     bad_starts = ("I noticed", "I saw", "I came across")
     for bad in bad_starts:
         if body.startswith(bad):
-            # Trim the first sentence and keep the rest, or fall back if too short
             parts = re.split(r"(?<=[.!?])\s+", body, maxsplit=1)
             if len(parts) == 2:
                 body = parts[1].lstrip()
             break
-
-    subj = subj[:120]
 
     return {
         "subject": subj,
