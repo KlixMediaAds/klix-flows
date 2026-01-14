@@ -37,6 +37,67 @@ Do NOT include:
 """.strip()
 
 
+# ==============================================================================
+# Deterministic scorer (NO LLMs)
+# ==============================================================================
+
+def _score_email_candidate(subject: str, body_md: str) -> tuple[float, list[str]]:
+    reasons: list[str] = []
+    subject = (subject or "").strip()
+    body = (body_md or "").strip()
+
+    score = 1.0
+
+    if not subject:
+        score -= 0.25
+        reasons.append("missing_subject")
+
+    if not body:
+        score -= 0.60
+        reasons.append("missing_body")
+        return max(0.0, min(1.0, score)), reasons
+
+    qcount = body.count("?")
+    if qcount == 0:
+        score -= 0.10
+        reasons.append("no_question")
+    elif qcount > 1:
+        score -= 0.10
+        reasons.append("multiple_questions")
+
+    if len(subject) > 120:
+        score -= 0.05
+        reasons.append("subject_too_long")
+
+    if len(body) < 180:
+        score -= 0.10
+        reasons.append("body_too_short")
+
+    if len(body) > 900:
+        score -= 0.10
+        reasons.append("body_too_long")
+
+    low = (subject + " " + body).lower()
+    spam_terms = [
+        "guarantee", "guaranteed", "risk-free", "act now", "limited time",
+        "free money", "earn $", "double your", "no obligation",
+    ]
+    hits = [t for t in spam_terms if t in low]
+    if hits:
+        score -= 0.10
+        reasons.append("spam_terms:" + ",".join(hits[:3]))
+
+    if low.count("!") >= 2:
+        score -= 0.05
+        reasons.append("too_many_exclamations")
+
+    return max(0.0, min(1.0, score)), reasons
+
+
+# ==============================================================================
+# Small helpers
+# ==============================================================================
+
 def _observation_from(biz: Dict[str, Any]) -> str:
     name = (biz.get("BusinessName") or "").strip()
     niche = (biz.get("Niche") or "").strip()
@@ -74,12 +135,16 @@ def _fallback_rule_based(biz: Dict[str, Any]) -> Dict[str, str]:
         f"{observation}\n\n"
         "I had a small idea for a short, quiet video: a few simple close-ups that show your product or service "
         "in use, with gentle pacing and subtle sound. Nothing loud or salesy—just a moment that feels like your brand.\n\n"
-        "If that kind of piece could be useful, I can sketch a couple of tiny directions."
+        "If that kind of piece could be useful, I can sketch a couple of tiny directions?"
     )
+
+    score, reasons = _score_email_candidate(subject, body)
 
     return {
         "subject": subject,
         "body_md": body.strip(),
+        "score": score,
+        "score_reasons": reasons,
     }
 
 
@@ -105,6 +170,10 @@ def _extract_json(text: str) -> Dict[str, Any]:
                 return {}
         return {}
 
+
+# ==============================================================================
+# OpenAI caller
+# ==============================================================================
 
 def _call_model(messages: List[Dict[str, Any]], model_name: str, n: int = 3):
     api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
@@ -136,6 +205,10 @@ def _call_model(messages: List[Dict[str, Any]], model_name: str, n: int = 3):
             return None
     return None
 
+
+# ==============================================================================
+# Drafting
+# ==============================================================================
 
 def _build_user_prompt(biz: Dict[str, Any], angle_id: str) -> str:
     name = biz.get("BusinessName") or ""
@@ -176,7 +249,7 @@ def draft_email(
     profile_id: Optional[int] = None,
     style_seed: Optional[str] = None,
     **_kwargs: Any,
-) -> Dict[str, str]:
+) -> Dict[str, Any]:
     _ = lead_id
     _ = profile_id
     _ = style_seed
@@ -221,7 +294,11 @@ def draft_email(
                 body = parts[1].lstrip()
             break
 
+    score, reasons = _score_email_candidate(subj, body)
+
     return {
         "subject": subj,
         "body_md": body,
+        "score": score,
+        "score_reasons": reasons,
     }
