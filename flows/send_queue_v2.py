@@ -62,6 +62,10 @@ def _is_legacy_garbage(subject: str, body: str) -> bool:
     return False
 
 
+
+# Treat cold_v2 as first-class cold in v2 sender
+COLD_SEND_TYPES = {"cold", "cold_v2"}
+
 # Hard safety: never send to known test / placeholder recipients
 SUPPRESSED_RECIPIENT_PATTERNS = [
     r"\\bYOUREMAIL\\b",
@@ -372,7 +376,7 @@ def _load_recent_cold_stats(logger) -> Tuple[int, Dict[str, int], int, int, floa
                 """
                 SELECT inbox_id, COUNT(*) AS cnt
                   FROM email_sends
-                 WHERE send_type = 'cold'
+                 WHERE send_type IN ('cold','cold_v2')
                    AND status = 'sent'
                    AND sent_at >= NOW() - INTERVAL '24 hours'
                  GROUP BY inbox_id
@@ -940,7 +944,7 @@ def send_queue_v2_flow(
                     continue
 
             # Prompt spine guardrail for cold emails
-            if send_type == "cold":
+            if send_type in COLD_SEND_TYPES:
                 if not prompt_angle_id:
                     err = "cold email missing prompt spine (prompt_angle_id)"
                     _finalize_fail(send_id, inbox, "", err, live=False)
@@ -969,7 +973,7 @@ def send_queue_v2_flow(
 
             body_text, body_html = _make_bodies_for_send(send_id, body)
 
-            if send_type == "cold" and not (body_text or body_html):
+            if send_type in COLD_SEND_TYPES and not (body_text or body_html):
                 err = "cold email missing body content after _make_bodies_for_send"
                 _finalize_fail(send_id, inbox, to_email, err, live=False)
                 log_send_event(inbox_id, send_id, "send_error", "missing body content for cold email; auto-failed job")
@@ -1007,7 +1011,7 @@ def send_queue_v2_flow(
 
                 per_inbox_sent_this_run[inbox_id_key] = int(per_inbox_sent_this_run.get(inbox_id_key, 0)) + 1
 
-                if send_type == "cold":
+                if send_type in COLD_SEND_TYPES:
                     cold_sent_this_run += 1
                     per_inbox_cold_24h[inbox_id_key] = cold_24h_for_inbox + 1
 

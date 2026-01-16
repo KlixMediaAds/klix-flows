@@ -6,7 +6,7 @@ WHERE e.id = (
     SELECT id
     FROM email_sends
     WHERE status = 'queued'
-      AND send_type = 'cold'
+      AND send_type = 'cold_v2'
       AND prompt_angle_id IS NOT NULL
       AND to_email IS NOT NULL
       AND subject  IS NOT NULL
