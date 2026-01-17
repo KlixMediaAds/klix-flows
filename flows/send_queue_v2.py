@@ -757,9 +757,10 @@ def send_queue_v2_flow(
                 (subject or "")[:72],
             )
 
-            # DRY RUN: requeue and count as preview (never "sent")
+            # DRY RUN: finalize as sent (provider_message_id='dry-run') and count as preview
+            # This prevents the same queued row from being reclaimed repeatedly in a single run.
             if not live:
-                _requeue_job(send_id)
+                _finalize_ok(send_id, inbox, to_email, "dry-run", live=False)
                 previewed += 1
                 previewed_this_pass += 1
                 continue
