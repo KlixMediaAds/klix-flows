@@ -21,7 +21,7 @@ deployments:
     tags: [cold]
     entrypoint: flows/send_queue_v2.py:send_queue_v2_flow
     parameters:
-      batch_size: 1
+      batch_size: 10
       allow_weekend: false
       dry_run: false
     work_pool:
@@ -30,6 +30,9 @@ deployments:
       job_variables:
         working_dir: /opt/klix/klix-flows
     schedules:
+      - cron: "*/5 9-12 * * 1-5"
+        timezone: "America/Toronto"
+        active: true
       - cron: "*/5 14-22 * * 1-5"
         timezone: "America/Toronto"
         active: true
@@ -49,4 +52,4 @@ deployments:
     schedules:
       - cron: "*/5 * * * *"
         timezone: "America/Toronto"
-        active: true
+        active: false
