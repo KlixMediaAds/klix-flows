@@ -1,55 +1,57 @@
 version: 3.0
-
 deployments:
-  - name: runbook-daily
-    description: >
-      Daily 3PM ET governance runbook: env sanity, send window,
-      deployments, inbox health, angles, fuel, queue states, caps.
-    tags: [governance, runbook]
-    entrypoint: flows/runbook_daily.py:runbook_daily_flow
-    parameters: {}
-    work_pool:
-      name: klix-managed
-      job_variables:
-        working_dir: /opt/klix/klix-flows
-    schedules:
-      - cron: "0 15 * * 1-5"
-        timezone: "America/Toronto"
-        active: true
+- name: runbook-daily
+  description: 'Daily 3PM ET governance runbook: env sanity, send window, deployments,
+    inbox health, angles, fuel, queue states, caps.
 
-  - name: send-queue-v2
-    tags: [cold]
-    entrypoint: flows/send_queue_v2.py:send_queue_v2_flow
-    parameters:
-      batch_size: 10
-      allow_weekend: false
-      dry_run: false
-    work_pool:
-      name: klix-managed
-      work_queue_name: cold-drip
-      job_variables:
-        working_dir: /opt/klix/klix-flows
-    schedules:
-      - cron: "*/5 9-12 * * 1-5"
-        timezone: "America/Toronto"
-        active: true
-      - cron: "*/5 14-22 * * 1-5"
-        timezone: "America/Toronto"
-        active: true
-
-  - name: send-queue-v2-5min
-    tags: [cold]
-    entrypoint: flows/send_queue_v2.py:send_queue_v2_flow
-    parameters:
-      batch_size: 1
-      allow_weekend: false
-      dry_run: false
-    work_pool:
-      name: klix-managed
-      work_queue_name: cold-drip
-      job_variables:
-        working_dir: /opt/klix/klix-flows
-    schedules:
-      - cron: "*/5 * * * *"
-        timezone: "America/Toronto"
-        active: false
+    '
+  tags:
+  - governance
+  - runbook
+  entrypoint: flows/runbook_daily.py:runbook_daily_flow
+  parameters: {}
+  work_pool:
+    name: klix-managed
+    job_variables:
+      working_dir: /opt/klix/klix-flows
+  schedules:
+  - cron: 0 15 * * 1-5
+    timezone: America/Toronto
+    active: true
+- name: send-queue-v2
+  tags:
+  - cold
+  entrypoint: flows/send_queue_v2.py:send_queue_v2_flow
+  parameters:
+    batch_size: 10
+    allow_weekend: false
+    dry_run: false
+  work_pool:
+    name: klix-managed
+    work_queue_name: cold-drip
+    job_variables:
+      working_dir: /opt/klix/klix-flows
+  schedules:
+  - cron: '*/5 9-12 * * 1-5'
+    timezone: America/Toronto
+    active: true
+  - cron: '*/5 14-22 * * 1-5'
+    timezone: America/Toronto
+    active: true
+- name: send-queue-v2-5min
+  tags:
+  - cold
+  entrypoint: flows/send_queue_v2.py:send_queue_v2_flow
+  parameters:
+    batch_size: 1
+    allow_weekend: false
+    dry_run: false
+  work_pool:
+    name: klix-managed
+    work_queue_name: cold-drip
+    job_variables:
+      working_dir: /opt/klix/klix-flows
+  schedules:
+  - cron: '*/5 * * * *'
+    timezone: America/Toronto
+    active: true
